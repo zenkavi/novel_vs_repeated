@@ -2,8 +2,15 @@
 level1_helpers.py
 Helper functions for the value_parametric level 1 GLM model.
 
+Supports 4 model variants that differ in how reaction time is handled:
+
+  rt_in_duration:          RT as duration of stim_ev and stim_value_par
+  fixed_duration:          Fixed duration (0 = stick) for stimulus regressors
+  rt_duration_plus_mod:    Variable duration + RT parametric modulator
+  fixed_duration_plus_mod: Fixed duration + RT parametric modulator
+
 Includes:
-  - Event formatting
+  - Event formatting (declarative regressor specs)
   - Confound loading
   - Design matrix construction
   - VIF computation
@@ -27,6 +34,120 @@ import seaborn as sns
 from nilearn.glm.first_level import make_first_level_design_matrix
 from nilearn.plotting import plot_design_matrix
 from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+
+# =============================================================================
+# Model variant definitions
+# =============================================================================
+
+# Each variant is defined by:
+#   - regressor_specs: per-task list of (reg_name, event_type, modulation)
+#   - task_regressors: columns to show in correlation/VIF plots
+#   - stim_duration: None (use event file duration, i.e. RT) or 0 (stick)
+#   - description: human-readable label for reports
+
+MODEL_VARIANTS = {
+    'rt_in_duration': {
+        'description': 'RT as stimulus duration',
+        'stim_duration': None,
+        'regressor_specs': {
+            'yesNo': [
+                ('cross_ev',        'fixCross', 1),
+                ('stim_ev',         'stim',     1),
+                ('stim_value_par',  'stim',     'valStim_dmn'),
+                ('feedback_ev',     'feedback', 1),
+                ('reward_par',      'feedback', 'reward_dmn'),
+            ],
+            'binaryChoice': [
+                ('cross_ev',        'fixCross', 1),
+                ('stim_ev',         'stim',     1),
+                ('stim_value_par',  'stim',     'valChosenMinusUnchosen_dmn'),
+                ('feedback_ev',     'feedback', 1),
+                ('reward_par',      'feedback', 'reward_dmn'),
+            ],
+        },
+        'task_regressors': [
+            'cross_ev', 'stim_ev', 'stim_value_par',
+            'feedback_ev', 'reward_par',
+        ],
+    },
+    'fixed_duration': {
+        'description': 'Fixed stimulus duration (stick function)',
+        'stim_duration': 0,
+        'regressor_specs': {
+            'yesNo': [
+                ('cross_ev',        'fixCross', 1),
+                ('stim_ev',         'stim',     1),
+                ('stim_value_par',  'stim',     'valStim_dmn'),
+                ('feedback_ev',     'feedback', 1),
+                ('reward_par',      'feedback', 'reward_dmn'),
+            ],
+            'binaryChoice': [
+                ('cross_ev',        'fixCross', 1),
+                ('stim_ev',         'stim',     1),
+                ('stim_value_par',  'stim',     'valChosenMinusUnchosen_dmn'),
+                ('feedback_ev',     'feedback', 1),
+                ('reward_par',      'feedback', 'reward_dmn'),
+            ],
+        },
+        'task_regressors': [
+            'cross_ev', 'stim_ev', 'stim_value_par',
+            'feedback_ev', 'reward_par',
+        ],
+    },
+    'rt_duration_plus_mod': {
+        'description': 'RT as stimulus duration + RT parametric modulator',
+        'stim_duration': None,
+        'regressor_specs': {
+            'yesNo': [
+                ('cross_ev',        'fixCross', 1),
+                ('stim_ev',         'stim',     1),
+                ('stim_value_par',  'stim',     'valStim_dmn'),
+                ('stim_rt_par',     'stim',     '_rt_dmn'),
+                ('feedback_ev',     'feedback', 1),
+                ('reward_par',      'feedback', 'reward_dmn'),
+            ],
+            'binaryChoice': [
+                ('cross_ev',        'fixCross', 1),
+                ('stim_ev',         'stim',     1),
+                ('stim_value_par',  'stim',     'valChosenMinusUnchosen_dmn'),
+                ('stim_rt_par',     'stim',     '_rt_dmn'),
+                ('feedback_ev',     'feedback', 1),
+                ('reward_par',      'feedback', 'reward_dmn'),
+            ],
+        },
+        'task_regressors': [
+            'cross_ev', 'stim_ev', 'stim_value_par', 'stim_rt_par',
+            'feedback_ev', 'reward_par',
+        ],
+    },
+    'fixed_duration_plus_mod': {
+        'description': 'Fixed stimulus duration + RT parametric modulator',
+        'stim_duration': 0,
+        'regressor_specs': {
+            'yesNo': [
+                ('cross_ev',        'fixCross', 1),
+                ('stim_ev',         'stim',     1),
+                ('stim_value_par',  'stim',     'valStim_dmn'),
+                ('stim_rt_par',     'stim',     '_rt_dmn'),
+                ('feedback_ev',     'feedback', 1),
+                ('reward_par',      'feedback', 'reward_dmn'),
+            ],
+            'binaryChoice': [
+                ('cross_ev',        'fixCross', 1),
+                ('stim_ev',         'stim',     1),
+                ('stim_value_par',  'stim',     'valChosenMinusUnchosen_dmn'),
+                ('stim_rt_par',     'stim',     '_rt_dmn'),
+                ('feedback_ev',     'feedback', 1),
+                ('reward_par',      'feedback', 'reward_dmn'),
+            ],
+        },
+        'task_regressors': [
+            'cross_ev', 'stim_ev', 'stim_value_par', 'stim_rt_par',
+            'feedback_ev', 'reward_par',
+        ],
+    },
+}
 
 
 # =============================================================================
@@ -92,33 +213,6 @@ def get_n_scans(subnum, session, task, runnum, data_path, space):
 # Event formatting
 # =============================================================================
 
-# Regressor specifications per task.
-# Each entry is (regressor_name, event_type_to_filter, modulation_source).
-# modulation_source is either:
-#   - a number (e.g. 1) for unmodulated regressors
-#   - a string naming a column in the behavior file for parametric modulators
-#
-# To define a new model or task, add an entry here rather than editing
-# the function body.
-
-REGRESSOR_SPECS = {
-    'yesNo': [
-        ('cross_ev',        'fixCross', 1),
-        ('stim_ev',         'stim',     1),
-        ('stim_value_par',  'stim',     'valStim_dmn'),
-        ('feedback_ev',     'feedback', 1),
-        ('reward_par',      'feedback', 'reward_dmn'),
-    ],
-    'binaryChoice': [
-        ('cross_ev',        'fixCross', 1),
-        ('stim_ev',         'stim',     1),
-        ('stim_value_par',  'stim',     'valChosenMinusUnchosen_dmn'),
-        ('feedback_ev',     'feedback', 1),
-        ('reward_par',      'feedback', 'reward_dmn'),
-    ],
-}
-
-
 def _load_events_and_behavior(subnum, session, task, runnum, data_path):
     """
     Load the events and behavioral files for one run, and verify that
@@ -157,7 +251,8 @@ def _load_events_and_behavior(subnum, session, task, runnum, data_path):
     return events, behavior
 
 
-def _make_regressor(events, behavior, event_type, reg_name, modulation):
+def _make_regressor(events, behavior, event_type, reg_name, modulation,
+                    stim_duration=None):
     """
     Build a single regressor DataFrame from events and behavior.
 
@@ -173,35 +268,45 @@ def _make_regressor(events, behavior, event_type, reg_name, modulation):
         Name for this regressor in the design matrix.
     modulation : int, float, or str
         If numeric, used as a constant modulation value (1 for unmodulated).
-        If a string, treated as a column name in the behavior DataFrame.
-        For 'stim' and 'feedback' event types, the behavioral column is
-        aligned positionally to the filtered events.
+        If the string '_rt_dmn', computes demeaned RT from the original stim
+        durations (before any duration override).
+        Otherwise, treated as a column name in the behavior DataFrame.
+    stim_duration : float or None
+        If not None, override the duration for 'stim' event types with this
+        fixed value. Does not affect 'fixCross' or 'feedback' events.
 
     Returns
     -------
     DataFrame with columns: onset, duration, trial_type, modulation
     """
-    df = events.query(f'trial_type == "{event_type}"')[['onset', 'duration']].reset_index(drop=True)
-    df['trial_type'] = reg_name
+    df = events.query(
+        f'trial_type == "{event_type}"'
+    )[['onset', 'duration']].reset_index(drop=True)
 
-    if isinstance(modulation, (int, float)):
-        df['modulation'] = modulation
+    # Compute RT modulator BEFORE overriding duration, so it always
+    # reflects the actual reaction time regardless of the variant.
+    if modulation == '_rt_dmn':
+        rt = df['duration'].values.copy()
+        mod_values = rt - rt.mean()
+    elif isinstance(modulation, (int, float)):
+        mod_values = modulation
     else:
-        # Behavioral data has one row per trial. Stim and feedback events
-        # appear in the same trial order, so positional alignment works
-        # for both event types.
-        df['modulation'] = behavior[modulation].values
+        mod_values = behavior[modulation].values
+
+    # Override stim duration if requested (only for stim events)
+    if stim_duration is not None and event_type == 'stim':
+        df['duration'] = stim_duration
+
+    df['trial_type'] = reg_name
+    df['modulation'] = mod_values
 
     return df
 
 
 def get_events_value_parametric(subnum, session, task, runnum, data_path,
-                                regressor_specs=None):
+                                regressor_specs=None, stim_duration=None):
     """
     Build event regressors for the value parametric model.
-
-    The regressors are defined by the REGRESSOR_SPECS dict (keyed by task),
-    or can be overridden via the regressor_specs argument.
 
     Parameters
     ----------
@@ -209,7 +314,9 @@ def get_events_value_parametric(subnum, session, task, runnum, data_path,
         Standard BIDS identifiers and path.
     regressor_specs : list of tuples, optional
         Each tuple is (reg_name, event_type, modulation_source).
-        If None, uses REGRESSOR_SPECS[task].
+        If None, uses the 'rt_in_duration' variant specs for this task.
+    stim_duration : float or None
+        If not None, override stimulus event durations with this fixed value.
 
     Returns
     -------
@@ -221,16 +328,11 @@ def get_events_value_parametric(subnum, session, task, runnum, data_path,
     )
 
     if regressor_specs is None:
-        if task not in REGRESSOR_SPECS:
-            raise ValueError(
-                f"No regressor specs defined for task '{task}'. "
-                f"Available: {list(REGRESSOR_SPECS.keys())}. "
-                f"Pass regressor_specs explicitly for a new task."
-            )
-        regressor_specs = REGRESSOR_SPECS[task]
+        regressor_specs = MODEL_VARIANTS['rt_in_duration']['regressor_specs'][task]
 
     regressors = [
-        _make_regressor(events, behavior, event_type, reg_name, modulation)
+        _make_regressor(events, behavior, event_type, reg_name, modulation,
+                        stim_duration=stim_duration)
         for reg_name, event_type, modulation in regressor_specs
     ]
 
@@ -247,6 +349,7 @@ def get_events_value_parametric(subnum, session, task, runnum, data_path,
 
 def make_design_matrix_value_parametric(
     subnum, session, task, runnum, data_path,
+    model_variant='rt_in_duration',
     space='MNI152NLin2009cAsym_res-2',
     hrf_model='spm', drift_model='cosine',
     scrub_thresh=0.5
@@ -254,15 +357,26 @@ def make_design_matrix_value_parametric(
     """
     Build the first-level design matrix for the value parametric model.
 
-    Reads TR from sidecar, n_scans from the preprocessed BOLD, confounds
-    from fmriprep, and events/behavior from BIDS.
+    Parameters
+    ----------
+    model_variant : str
+        One of: 'rt_in_duration', 'fixed_duration',
+        'rt_duration_plus_mod', 'fixed_duration_plus_mod'.
     """
+    variant = MODEL_VARIANTS[model_variant]
+
     tr = get_from_sidecar(subnum, session, task, runnum, 'RepetitionTime', data_path)
     n_scans = get_n_scans(subnum, session, task, runnum, data_path, space)
     frame_times = np.arange(n_scans) * tr
 
-    formatted_events = get_events_value_parametric(subnum, session, task, runnum, data_path)
-    formatted_confounds = get_confounds(subnum, session, task, runnum, data_path, scrub_thresh=scrub_thresh)
+    formatted_events = get_events_value_parametric(
+        subnum, session, task, runnum, data_path,
+        regressor_specs=variant['regressor_specs'][task],
+        stim_duration=variant['stim_duration'],
+    )
+    formatted_confounds = get_confounds(
+        subnum, session, task, runnum, data_path, scrub_thresh=scrub_thresh
+    )
 
     design_matrix = make_first_level_design_matrix(
         frame_times,
@@ -291,10 +405,13 @@ def compute_vif(design_matrix, columns=None):
     design_matrix : DataFrame
         Full design matrix.
     columns : list or None
-        Columns to compute VIF for. Defaults to TASK_REGRESSORS.
+        Columns to compute VIF for. If None, auto-detects task regressors.
     """
     if columns is None:
-        columns = [c for c in TASK_REGRESSORS if c in design_matrix.columns]
+        nuisance = ['trans', 'rot', 'drift', 'framewise', 'scrub',
+                     'constant', 'dvars']
+        columns = [c for c in design_matrix.columns
+                   if all(n not in c for n in nuisance)]
     dm = design_matrix[columns].copy()
 
     nonzero_cols = dm.columns[dm.abs().sum() > 0]
@@ -302,7 +419,8 @@ def compute_vif(design_matrix, columns=None):
 
     vif_data = pd.DataFrame({
         'regressor': dm.columns,
-        'VIF': [variance_inflation_factor(dm.values, i) for i in range(dm.shape[1])]
+        'VIF': [variance_inflation_factor(dm.values, i)
+                for i in range(dm.shape[1])]
     })
     return vif_data
 
@@ -315,7 +433,7 @@ def make_contrasts(design_matrix):
     """
     Build contrast vectors for the value parametric model.
 
-    Returns canonical contrasts for each behavioral regressor (vs baseline).
+    Returns canonical contrasts for each task regressor (vs baseline).
     """
     contrast_matrix = np.eye(design_matrix.shape[1])
     contrasts = {
@@ -323,7 +441,8 @@ def make_contrasts(design_matrix):
         for i, col in enumerate(design_matrix.columns)
     }
 
-    to_filter = ['trans', 'rot', 'drift', 'framewise', 'scrub', 'constant', 'dvars', 'choice']
+    to_filter = ['trans', 'rot', 'drift', 'framewise', 'scrub',
+                 'constant', 'dvars']
     beh_contrasts = {
         k: v for k, v in contrasts.items()
         if all(filt not in k for filt in to_filter)
@@ -354,12 +473,9 @@ def plot_dm(dm, title=''):
     return fig
 
 
-TASK_REGRESSORS = ['cross_ev', 'stim_ev', 'stim_value_par', 'feedback_ev', 'reward_par']
-
-
 def plot_correlation_matrix(dm, title='', columns=None):
-    """Plot lower-triangle correlation heatmap, return figure.
-    
+    """Plot lower-triangle correlation heatmap for task regressors.
+
     Parameters
     ----------
     dm : DataFrame
@@ -367,12 +483,18 @@ def plot_correlation_matrix(dm, title='', columns=None):
     title : str
         Plot title.
     columns : list or None
-        If provided, restrict to these columns. Defaults to TASK_REGRESSORS.
+        If provided, restrict to these columns. If None, auto-detects
+        task regressors (excludes nuisance/drift/constant).
     """
     if columns is None:
-        columns = [c for c in TASK_REGRESSORS if c in dm.columns]
+        nuisance = ['trans', 'rot', 'drift', 'framewise', 'scrub',
+                     'constant', 'dvars']
+        columns = [c for c in dm.columns
+                   if all(n not in c for n in nuisance)]
     corr = dm[columns].corr()
-    fig, ax = plt.subplots(figsize=(7, 6))
+    n = len(columns)
+    figsize = (max(5, n * 1.2), max(4, n * 1.0))
+    fig, ax = plt.subplots(figsize=figsize)
     mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
     sns.heatmap(
         corr, mask=mask, cmap='RdBu_r', center=0,
@@ -386,14 +508,14 @@ def plot_correlation_matrix(dm, title='', columns=None):
 
 def plot_vif(vif_data, title=''):
     """Plot VIF bar chart with threshold lines, return figure."""
-    fig, ax = plt.subplots(figsize=(10, max(6, len(vif_data) * 0.35)))
+    fig, ax = plt.subplots(figsize=(10, max(4, len(vif_data) * 0.5)))
     colors = [
         '#d62728' if v > 10 else '#ff7f0e' if v > 5 else '#2ca02c'
         for v in vif_data['VIF']
     ]
     ax.barh(range(len(vif_data)), vif_data['VIF'], color=colors)
     ax.set_yticks(range(len(vif_data)))
-    ax.set_yticklabels(vif_data['regressor'], fontsize=8)
+    ax.set_yticklabels(vif_data['regressor'], fontsize=9)
     ax.set_xlabel('VIF')
     ax.set_title(title)
     ax.axvline(x=5, color='orange', linestyle='--', alpha=0.7, label='VIF = 5')
@@ -418,6 +540,7 @@ def _fig_to_base64(fig):
 
 def generate_report(
     subnum, session, data_path,
+    model_variant='rt_in_duration',
     mnum='value_parametric',
     space='MNI152NLin2009cAsym_res-2',
     hrf_model='spm', drift_model='cosine',
@@ -430,15 +553,6 @@ def generate_report(
 
     For ses-01 this means: yesNo run-01, yesNo run-02, binaryChoice run-03.
 
-    The report contains for each run:
-      - Design matrix plot
-      - Correlation matrix
-      - VIF bar chart
-      - Parametric modulator summary statistics
-      - VIF table
-
-    It also includes a cross-run section with contrasts.
-
     Parameters
     ----------
     subnum : str
@@ -447,8 +561,11 @@ def generate_report(
         Session number (e.g. '01')
     data_path : str
         Path to the BIDS root directory
+    model_variant : str
+        One of: 'rt_in_duration', 'fixed_duration',
+        'rt_duration_plus_mod', 'fixed_duration_plus_mod'.
     mnum : str
-        Model name
+        Model name (used in filenames)
     space : str
         Output space identifier
     hrf_model : str
@@ -467,10 +584,11 @@ def generate_report(
     design_matrices : dict
         Dictionary mapping (task, runnum) to design matrix DataFrames
     """
+    variant = MODEL_VARIANTS[model_variant]
+    task_regs = variant['task_regressors']
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Define runs for this session
     runs = [
         ('yesNo', '01'),
         ('yesNo', '02'),
@@ -482,25 +600,35 @@ def generate_report(
 
     for task, runnum in runs:
         run_label = f'task-{task}_run-{runnum}'
-        print(f"  Processing sub-{subnum} ses-{session} {run_label}...")
+        print(f"  Processing sub-{subnum} ses-{session} {run_label} "
+              f"[{model_variant}]...")
 
         # -- Build design matrix --
         dm = make_design_matrix_value_parametric(
             subnum, session, task, runnum, data_path,
+            model_variant=model_variant,
             space=space, hrf_model=hrf_model, drift_model=drift_model,
             scrub_thresh=scrub_thresh
         )
         design_matrices[(task, runnum)] = dm
 
         # -- Save design matrix CSV --
-        dm_fn = f'sub-{subnum}_ses-{session}_{run_label}_{mnum}_design_matrix.csv'
+        dm_fn = (f'sub-{subnum}_ses-{session}_{run_label}_{mnum}'
+                 f'_design_matrix.csv')
         dm.to_csv(os.path.join(output_dir, dm_fn), index=False)
 
         # -- Parametric modulator stats --
-        formatted_events = get_events_value_parametric(subnum, session, task, runnum, data_path)
+        formatted_events = get_events_value_parametric(
+            subnum, session, task, runnum, data_path,
+            regressor_specs=variant['regressor_specs'][task],
+            stim_duration=variant['stim_duration'],
+        )
+        par_regs = [r for r in task_regs if '_par' in r]
         par_stats = {}
-        for reg in ['stim_value_par', 'reward_par']:
-            vals = formatted_events.query(f'trial_type == "{reg}"')['modulation']
+        for reg in par_regs:
+            vals = formatted_events.query(
+                f'trial_type == "{reg}"'
+            )['modulation']
             par_stats[reg] = {
                 'mean': f'{vals.mean():.3f}',
                 'std': f'{vals.std():.3f}',
@@ -509,24 +637,33 @@ def generate_report(
             }
 
         # -- Confound summary --
-        confounds = get_confounds(subnum, session, task, runnum, data_path, scrub_thresh)
+        confounds = get_confounds(
+            subnum, session, task, runnum, data_path, scrub_thresh
+        )
         n_scrubbed = int(confounds['scrub'].sum())
         n_volumes = len(confounds)
 
-        # -- Plots --
-        fig_dm = plot_dm(dm, title=f'sub-{subnum} ses-{session} {run_label}')
+        # -- Plots (task regressors only for corr and VIF) --
+        task_cols = [c for c in task_regs if c in dm.columns]
+
+        fig_dm = plot_dm(
+            dm, title=f'sub-{subnum} ses-{session} {run_label}')
         img_dm = _fig_to_base64(fig_dm)
 
-        fig_corr = plot_correlation_matrix(dm, title=f'Correlations: sub-{subnum} ses-{session} {run_label}')
+        fig_corr = plot_correlation_matrix(
+            dm,
+            title=f'Correlations: sub-{subnum} ses-{session} {run_label}',
+            columns=task_cols)
         img_corr = _fig_to_base64(fig_corr)
 
-        vif_data = compute_vif(dm)
-        fig_vif = plot_vif(vif_data, title=f'VIF: sub-{subnum} ses-{session} {run_label}')
+        vif_data = compute_vif(dm, columns=task_cols)
+        fig_vif = plot_vif(
+            vif_data,
+            title=f'VIF: sub-{subnum} ses-{session} {run_label}')
         img_vif = _fig_to_base64(fig_vif)
 
-        # -- Behavioral regressor correlations --
-        beh_cols = [c for c in TASK_REGRESSORS if c in dm.columns]
-        beh_corr = dm[beh_cols].corr().round(3)
+        # -- Task regressor correlations --
+        beh_corr = dm[task_cols].corr().round(3)
 
         # -- Build HTML section for this run --
         vif_rows = ''
@@ -536,7 +673,8 @@ def generate_report(
                 css_class = ' class="vif-severe"'
             elif row['VIF'] > 5:
                 css_class = ' class="vif-moderate"'
-            vif_rows += f'<tr{css_class}><td>{row["regressor"]}</td><td>{row["VIF"]:.2f}</td></tr>\n'
+            vif_rows += (f'<tr{css_class}><td>{row["regressor"]}</td>'
+                         f'<td>{row["VIF"]:.2f}</td></tr>\n')
 
         par_rows = ''
         for reg, stats in par_stats.items():
@@ -546,7 +684,8 @@ def generate_report(
                 f'<td>{stats["min"]}</td><td>{stats["max"]}</td></tr>\n'
             )
 
-        beh_corr_html = beh_corr.to_html(classes='corr-table', float_format='%.3f')
+        beh_corr_html = beh_corr.to_html(
+            classes='corr-table', float_format='%.3f')
 
         section = f"""
         <div class="run-section">
@@ -576,18 +715,18 @@ def generate_report(
 
             <div class="plot-row">
                 <div class="plot-container half">
-                    <h3>Correlation Matrix</h3>
+                    <h3>Correlation Matrix (task regressors)</h3>
                     <img src="data:image/png;base64,{img_corr}" />
                 </div>
                 <div class="plot-container half">
-                    <h3>Variance Inflation Factors</h3>
+                    <h3>Variance Inflation Factors (task regressors)</h3>
                     <img src="data:image/png;base64,{img_vif}" />
                 </div>
             </div>
 
             <div class="tables-row">
                 <div class="table-container">
-                    <h3>Behavioral Regressor Correlations</h3>
+                    <h3>Task Regressor Correlations</h3>
                     {beh_corr_html}
                 </div>
                 <div class="table-container">
@@ -602,37 +741,40 @@ def generate_report(
         """
         run_sections_html.append(section)
 
-    # -- Contrasts section (using first run's design matrix as template) --
+    # -- Contrasts section --
     first_dm = list(design_matrices.values())[0]
     contrasts = make_contrasts(first_dm)
     contrasts_rows = ''
     for name, vec in contrasts.items():
         nonzero = [first_dm.columns[i] for i in np.where(vec != 0)[0]]
-        contrasts_rows += f'<tr><td>{name}</td><td>{", ".join(nonzero)}</td></tr>\n'
+        contrasts_rows += (f'<tr><td>{name}</td>'
+                           f'<td>{", ".join(nonzero)}</td></tr>\n')
 
-    # Save contrasts JSON
     contrasts_json = {k: v.tolist() for k, v in contrasts.items()}
     contrasts_fn = f'sub-{subnum}_ses-{session}_{mnum}_contrasts.json'
     with open(os.path.join(output_dir, contrasts_fn), 'w') as f:
         json.dump(contrasts_json, f, indent=4)
 
-    # -- Column consistency check across runs --
+    # -- Column consistency check --
     all_cols = [set(dm.columns) for dm in design_matrices.values()]
     cols_match = all(c == all_cols[0] for c in all_cols[1:])
-    col_counts = {f'{t} run-{r}': len(dm.columns) for (t, r), dm in design_matrices.items()}
+    col_counts = {
+        f'{t} run-{r}': len(dm.columns)
+        for (t, r), dm in design_matrices.items()
+    }
 
     consistency_html = '<ul>\n'
     for label, count in col_counts.items():
         consistency_html += f'<li>{label}: {count} columns</li>\n'
-    consistency_html += f'<li>Columns identical across runs: {cols_match}</li>\n'
-    consistency_html += '</ul>'
+    consistency_html += (
+        f'<li>Columns identical across runs: {cols_match}</li>\n</ul>')
 
     # -- Assemble full HTML --
     html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>Level 1 Report: sub-{subnum} ses-{session} | {mnum}</title>
+<title>Level 1 Report: sub-{subnum} ses-{session} | {mnum} | {model_variant}</title>
 <style>
     body {{
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -698,6 +840,7 @@ def generate_report(
 <h1>Level 1 Design Matrix Report</h1>
 <p class="meta">
     Subject: sub-{subnum} | Session: ses-{session} | Model: {mnum}<br>
+    Variant: <strong>{model_variant}</strong> ({variant['description']})<br>
     Space: {space} | HRF: {hrf_model} | Drift: {drift_model} | Scrub threshold: {scrub_thresh}
 </p>
 
