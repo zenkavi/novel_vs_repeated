@@ -4,9 +4,9 @@ Helper functions for the value_parametric level 1 GLM model.
 
 Supports 4 model variants that differ in how reaction time is handled:
 
-  rt_in_duration:          RT as duration of stim_ev and stim_value_par
-  fixed_duration:          Fixed duration (0 = stick) for stimulus regressors
-  rt_duration_plus_mod:    Variable duration + RT parametric modulator
+  rt_in_duration:         RT as duration of stim_ev and stim_value_par
+  fixed_duration:         Fixed duration (0 = stick) for stimulus regressors
+  rt_duration_plus_mod:   Variable duration + RT parametric modulator
   fixed_duration_plus_mod: Fixed duration + RT parametric modulator
 
 Includes:
@@ -870,3 +870,319 @@ def generate_report(
 
     print(f"  Report saved: {report_path}")
     return report_path, design_matrices
+
+
+# =============================================================================
+# GLM fitting and contrast computation
+# =============================================================================
+
+def load_design_matrices(subnum, session, mnum, model_variant, dm_dir):
+    """
+    Load saved design matrix CSVs for all runs of a subject/session.
+
+    Parameters
+    ----------
+    subnum : str
+        Subject number (e.g. '601')
+    session : str
+        Session number (e.g. '01')
+    mnum : str
+        Model name (e.g. 'value_parametric')
+    model_variant : str
+        Variant name (e.g. 'rt_in_duration')
+    dm_dir : str
+        Directory where design matrix CSVs were saved by generate_report.
+        Expected path: {dm_dir}/{mnum}/{model_variant}/
+
+    Returns
+    -------
+    design_matrices : dict
+        Maps (task, runnum) to design matrix DataFrames.
+    """
+    dm_path = os.path.join(dm_dir, mnum, model_variant)
+
+    runs = [
+        ('yesNo', '01'),
+        ('yesNo', '02'),
+        ('binaryChoice', '03'),
+    ]
+
+    design_matrices = {}
+    for task, runnum in runs:
+        fn = os.path.join(
+            dm_path,
+            f'sub-{subnum}_ses-{session}_task-{task}_run-{runnum}'
+            f'_{mnum}_design_matrix.csv'
+        )
+        dm = pd.read_csv(fn)
+        design_matrices[(task, runnum)] = dm
+
+    return design_matrices
+
+
+def get_bold_and_mask(subnum, session, task, runnum, data_path, space):
+    """
+    Get paths to the preprocessed BOLD image and brain mask for one run.
+
+    Returns
+    -------
+    bold_path : str
+    mask_path : str
+    """
+    bold_path = os.path.join(
+        data_path,
+        f'derivatives/sub-{subnum}/ses-{session}/func/'
+        f'sub-{subnum}_ses-{session}_task-{task}_run-{runnum}'
+        f'_space-{space}_desc-preproc_bold.nii.gz'
+    )
+    mask_path = os.path.join(
+        data_path,
+        f'derivatives/sub-{subnum}/ses-{session}/func/'
+        f'sub-{subnum}_ses-{session}_task-{task}_run-{runnum}'
+        f'_space-{space}_desc-brain_mask.nii.gz'
+    )
+    return bold_path, mask_path
+
+
+def fit_level1(
+    subnum, session, data_path, dm_dir,
+    mnum='value_parametric',
+    model_variant='rt_in_duration',
+    space='MNI152NLin2009cAsym_res-2',
+    noise_model='ar1',
+    hrf_model='spm',
+    drift_model='cosine',
+    smoothing_fwhm=5,
+):
+    """
+    Fit the first-level GLM for one subject/session using pre-saved
+    design matrices.
+
+    Fits a fixed-effects model across all runs (yesNo run-01, run-02,
+    binaryChoice run-03) simultaneously.
+
+    Parameters
+    ----------
+    subnum : str
+        Subject number
+    session : str
+        Session number
+    data_path : str
+        BIDS root directory
+    dm_dir : str
+        Directory containing saved design matrix CSVs
+        (organized as {dm_dir}/{mnum}/{model_variant}/)
+    mnum : str
+        Model name
+    model_variant : str
+        Variant name
+    space : str
+        Output space
+    noise_model, hrf_model, drift_model : str
+        GLM parameters (should match what was used to build the design matrices)
+    smoothing_fwhm : float
+        Smoothing kernel FWHM in mm
+
+    Returns
+    -------
+    fmri_glm : FirstLevelModel
+        Fitted GLM object
+    design_matrices : list of DataFrames
+        Design matrices used (one per run, column-aligned)
+    """
+    import nibabel as nib
+    from nilearn.glm.first_level import FirstLevelModel
+
+    runs = [
+        ('yesNo', '01'),
+        ('yesNo', '02'),
+        ('binaryChoice', '03'),
+    ]
+
+    # Load saved design matrices
+    saved_dms = load_design_matrices(
+        subnum, session, mnum, model_variant, dm_dir
+    )
+
+    # Collect BOLD images and design matrices in run order
+    fmri_imgs = []
+    design_matrices = []
+
+    for task, runnum in runs:
+        bold_path, _ = get_bold_and_mask(
+            subnum, session, task, runnum, data_path, space
+        )
+        if not os.path.exists(bold_path):
+            raise FileNotFoundError(
+                f"Preprocessed BOLD not found: {bold_path}"
+            )
+        fmri_imgs.append(bold_path)
+        design_matrices.append(saved_dms[(task, runnum)])
+
+    # Align columns across runs (drift regressors may differ)
+    design_matrices = match_dm_cols(design_matrices)
+
+    # Use the mask from the last run
+    _, mask_path = get_bold_and_mask(
+        subnum, session, runs[-1][0], runs[-1][1], data_path, space
+    )
+    mask_img = nib.load(mask_path)
+
+    # Get TR
+    tr = get_from_sidecar(
+        subnum, session, runs[0][0], runs[0][1], 'RepetitionTime', data_path
+    )
+
+    # Define and fit GLM
+    fmri_glm = FirstLevelModel(
+        t_r=tr,
+        noise_model=noise_model,
+        hrf_model=hrf_model,
+        drift_model=drift_model,
+        smoothing_fwhm=smoothing_fwhm,
+        mask_img=mask_img,
+        subject_label=subnum,
+        minimize_memory=True,
+    )
+
+    print(f"  Fitting GLM for sub-{subnum} ses-{session} [{model_variant}]...")
+    fmri_glm = fmri_glm.fit(fmri_imgs, design_matrices=design_matrices)
+
+    return fmri_glm, design_matrices
+
+
+def save_glm_and_contrasts(
+    fmri_glm, design_matrices,
+    subnum, session, output_dir,
+    mnum='value_parametric',
+    model_variant='rt_in_duration',
+    space='MNI152NLin2009cAsym_res-2',
+):
+    """
+    Save the fitted GLM object and compute/save all contrast maps.
+
+    Output directory structure
+    -------------------------
+    {output_dir}/{mnum}/{model_variant}/
+        sub-{subnum}/ses-{session}/
+            {prefix}_level1_glm.pkl
+            {prefix}_contrasts.json
+            contrasts/
+                {prefix}_{contrast_id}_effect_size.nii.gz
+                {prefix}_{contrast_id}_tmap.nii.gz
+
+    Parameters
+    ----------
+    fmri_glm : FirstLevelModel
+        Fitted GLM
+    design_matrices : list of DataFrames
+        Column-aligned design matrices
+    subnum, session : str
+        Subject and session identifiers
+    output_dir : str
+        Root output directory for all GLM results
+    mnum : str
+        Model name
+    model_variant : str
+        Variant name
+    space : str
+        Output space
+    """
+    import nibabel as nib
+    import pickle
+
+    # Build output paths
+    deriv_base = os.path.join(
+        output_dir, mnum, model_variant,
+        f'sub-{subnum}', f'ses-{session}'
+    )
+    contrasts_path = os.path.join(deriv_base, 'contrasts')
+    os.makedirs(contrasts_path, exist_ok=True)
+
+    # Filename prefix
+    prefix = (f'sub-{subnum}_ses-{session}'
+              f'_space-{space}_{mnum}_{model_variant}')
+
+    # Save fitted GLM
+    glm_fn = os.path.join(deriv_base, f'{prefix}_level1_glm.pkl')
+    with open(glm_fn, 'wb') as f:
+        pickle.dump(fmri_glm, f)
+    print(f"  Saved GLM: {glm_fn}")
+
+    # Build contrasts from the first design matrix
+    contrasts = make_contrasts(design_matrices[0])
+
+    # Compute and save contrast maps
+    dm_ncols = len(design_matrices[0].columns)
+
+    for contrast_id, contrast_val in contrasts.items():
+        # Zero-pad or trim to match design matrix width
+        if len(contrast_val) < dm_ncols:
+            contrast_val = np.pad(
+                contrast_val, (0, dm_ncols - len(contrast_val))
+            )
+        elif len(contrast_val) > dm_ncols:
+            contrast_val = contrast_val[:dm_ncols]
+
+        # Effect size
+        effect_map = fmri_glm.compute_contrast(
+            contrast_val, output_type='effect_size'
+        )
+        effect_fn = os.path.join(
+            contrasts_path,
+            f'{prefix}_{contrast_id}_effect_size.nii.gz'
+        )
+        nib.save(effect_map, effect_fn)
+
+        # T-statistic
+        stat_map = fmri_glm.compute_contrast(
+            contrast_val, output_type='stat'
+        )
+        stat_fn = os.path.join(
+            contrasts_path,
+            f'{prefix}_{contrast_id}_tmap.nii.gz'
+        )
+        nib.save(stat_map, stat_fn)
+
+    print(f"  Saved {len(contrasts)} contrasts to: {contrasts_path}")
+
+    # Save contrasts JSON for reference
+    contrasts_json = {k: v.tolist() for k, v in contrasts.items()}
+    json_fn = os.path.join(deriv_base, f'{prefix}_contrasts.json')
+    with open(json_fn, 'w') as f:
+        json.dump(contrasts_json, f, indent=4)
+
+
+def run_level1_pipeline(
+    subnum, session, data_path, dm_dir, output_dir,
+    mnum='value_parametric',
+    model_variant='rt_in_duration',
+    space='MNI152NLin2009cAsym_res-2',
+    noise_model='ar1',
+    hrf_model='spm',
+    drift_model='cosine',
+    smoothing_fwhm=5,
+):
+    """
+    Full pipeline: load design matrices, fit GLM, save contrasts.
+
+    This is the main entry point for running a single subject/session.
+    """
+    fmri_glm, design_matrices = fit_level1(
+        subnum, session, data_path, dm_dir,
+        mnum=mnum,
+        model_variant=model_variant,
+        space=space,
+        noise_model=noise_model,
+        hrf_model=hrf_model,
+        drift_model=drift_model,
+        smoothing_fwhm=smoothing_fwhm,
+    )
+
+    save_glm_and_contrasts(
+        fmri_glm, design_matrices,
+        subnum, session, output_dir,
+        mnum=mnum,
+        model_variant=model_variant,
+        space=space,
+    )
