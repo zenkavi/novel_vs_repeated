@@ -1,3 +1,4 @@
 *.ipynb_checkpoints/  
 *__pycache__/
-*outputs/ 
+*outputs/
+src/mni152_2mm.nii.gz 
