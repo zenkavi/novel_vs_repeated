@@ -2,11 +2,15 @@
 level2_helpers.py
 Helper functions for group-level (second-level) analyses.
 
-Computes a one-sample t-test across subjects on first-level contrast maps
-(effect size maps) using nilearn's SecondLevelModel. Generates group stat
-maps and an HTML report with glass brain and ROI-centered visualizations.
+The workflow is split into two steps:
+  1. Fitting: run_group_onesample() collects subject maps, fits the model,
+     and saves group tmap and effect_size niftis.
+  2. Reporting: generate_group_report() loads saved group maps and builds
+     an HTML report with glass brain, ROI, and cluster visualizations.
 
-Reports are labeled as uncorrected (no multiple-comparison correction applied).
+This separation allows additional inference methods (e.g., non-parametric
+inference) to be slotted in between fitting and reporting, or to generate
+reports from previously computed maps without re-fitting.
 """
 
 import base64
@@ -28,9 +32,6 @@ from nilearn.reporting import get_clusters_table
 # =============================================================================
 # ROI definitions (MNI coordinates, bilateral)
 # =============================================================================
-
-# vmPFC: Noonan et al. (2011), Bartra et al. (2013) meta-analysis
-# lOFC: Kringelbach & Rolls (2004) meta-analysis
 
 ROI_COORDS = {
     'vmPFC': {
@@ -64,6 +65,31 @@ def get_contrast_path(
         f'sub-{subnum}', f'ses-{session}', 'contrasts',
         f'{prefix}_{contrast_id}_{map_type}.nii.gz'
     )
+
+
+def get_group_dir(output_dir, mnum, model_variant, session):
+    """Build the group output directory path."""
+    return os.path.join(
+        output_dir, mnum, model_variant,
+        'group', f'ses-{session}'
+    )
+
+
+def get_group_map_prefix(task, space, mnum, model_variant):
+    """Build the filename prefix for group-level maps."""
+    return f'group_task-{task}_space-{space}_{mnum}_{model_variant}'
+
+
+def get_group_tmap_path(
+    session, task, contrast_id, output_dir,
+    mnum='value_parametric',
+    model_variant='rt_in_duration',
+    space='MNI152NLin2009cAsym_res-2',
+):
+    """Build the full path to a saved group tmap."""
+    group_dir = get_group_dir(output_dir, mnum, model_variant, session)
+    prefix = get_group_map_prefix(task, space, mnum, model_variant)
+    return os.path.join(group_dir, f'{prefix}_{contrast_id}_tmap.nii.gz')
 
 
 def collect_contrast_maps(
@@ -101,13 +127,12 @@ def collect_contrast_maps(
 
 
 # =============================================================================
-# Group-level model
+# Group-level model fitting
 # =============================================================================
 
 def fit_group_onesample(contrast_maps):
     """
-    Fit a one-sample t-test (intercept-only second-level model) on a list
-    of first-level contrast maps.
+    Fit a one-sample t-test (intercept-only second-level model).
 
     Returns
     -------
@@ -127,6 +152,75 @@ def fit_group_onesample(contrast_maps):
     group_effect = second_level_model.compute_contrast(output_type='effect_size')
 
     return second_level_model, group_tmap, group_effect
+
+
+def run_group_onesample(
+    subjects, session, task, contrast_id, output_dir,
+    mnum='value_parametric',
+    model_variant='rt_in_duration',
+    space='MNI152NLin2009cAsym_res-2',
+):
+    """
+    Collect subject maps, fit the group one-sample t-test, and save
+    the group tmap and effect_size niftis.
+
+    Saves to:
+        {output_dir}/{mnum}/{model_variant}/group/ses-{session}/
+            {prefix}_{contrast_id}_tmap.nii.gz
+            {prefix}_{contrast_id}_effect_size.nii.gz
+
+    Parameters
+    ----------
+    subjects : list of str
+    session, task, contrast_id : str
+    output_dir : str
+        Root output directory
+    mnum, model_variant, space : str
+
+    Returns
+    -------
+    group_tmap_path : str
+        Path to saved group tmap
+    group_effect_path : str
+        Path to saved group effect_size map
+    """
+    import nibabel as nib
+
+    contrast_maps, missing = collect_contrast_maps(
+        subjects, session, task, contrast_id, output_dir,
+        mnum=mnum, model_variant=model_variant,
+        space=space, map_type='effect_size',
+    )
+
+    if missing:
+        print(f"  WARNING: Missing maps for subjects: {missing}")
+    if len(contrast_maps) < 2:
+        raise ValueError(
+            f"Need at least 2 subjects for group analysis, "
+            f"found {len(contrast_maps)}"
+        )
+
+    n_subjects = len(contrast_maps)
+    print(f"  Fitting group model: task-{task} {contrast_id} "
+          f"[{model_variant}] (n={n_subjects})")
+
+    model, group_tmap, group_effect = fit_group_onesample(contrast_maps)
+
+    group_dir = get_group_dir(output_dir, mnum, model_variant, session)
+    os.makedirs(group_dir, exist_ok=True)
+
+    prefix = get_group_map_prefix(task, space, mnum, model_variant)
+
+    tmap_path = os.path.join(group_dir, f'{prefix}_{contrast_id}_tmap.nii.gz')
+    nib.save(group_tmap, tmap_path)
+
+    effect_path = os.path.join(
+        group_dir, f'{prefix}_{contrast_id}_effect_size.nii.gz'
+    )
+    nib.save(group_effect, effect_path)
+
+    print(f"  Saved group maps to: {group_dir}")
+    return tmap_path, effect_path
 
 
 # =============================================================================
@@ -159,21 +253,6 @@ def plot_roi_view(stat_map, coords, title='', threshold=3.0):
     """
     Ortho (sagittal + coronal + axial) stat map centered on one coordinate
     with crosshairs at the ROI center.
-
-    Parameters
-    ----------
-    stat_map : Nifti1Image
-        Group stat map
-    coords : tuple of 3 ints/floats
-        MNI (x, y, z) coordinates to center on
-    title : str
-        Plot title
-    threshold : float
-        t-stat threshold for display
-
-    Returns
-    -------
-    fig : matplotlib Figure
     """
     fig = plt.figure(figsize=(12, 4))
     display = plot_stat_map(
@@ -186,7 +265,7 @@ def plot_roi_view(stat_map, coords, title='', threshold=3.0):
 
 
 # =============================================================================
-# Report
+# Report generation (reads saved maps, no fitting)
 # =============================================================================
 
 def generate_group_report(
@@ -199,92 +278,65 @@ def generate_group_report(
     roi_coords=None,
 ):
     """
-    Run a group-level one-sample t-test and generate an HTML report.
+    Generate an HTML report from previously saved group maps.
 
-    The report is labeled as uncorrected (no multiple-comparison correction).
-
-    Saves to:
+    Reads the group tmap from:
         {output_dir}/{mnum}/{model_variant}/group/ses-{session}/
             {prefix}_{contrast_id}_tmap.nii.gz
-            {prefix}_{contrast_id}_effect_size.nii.gz
-            {prefix}_{contrast_id}_uncorrected_report.html
+
+    Saves report to the same directory as:
+        {prefix}_{contrast_id}_uncorrected_report.html
 
     Parameters
     ----------
     subjects : list of str
-        Subject numbers to include
-    session : str
-        Session identifier
-    task : str
-        'yesNo' or 'binaryChoice'
-    contrast_id : str
-        Contrast name (e.g. 'stim_value_par')
+        Subject numbers (used for display in the report)
+    session, task, contrast_id : str
     output_dir : str
         Root output directory
     mnum, model_variant, space : str
-        Model identifiers
     threshold : float
-        t-statistic threshold for visualization (uncorrected)
+        t-stat threshold for visualization (uncorrected)
     cluster_threshold : int
-        Minimum cluster size (in voxels) for cluster table
+        Minimum cluster size (voxels) for cluster table
     roi_coords : dict or None
-        ROI definitions. If None, uses the default ROI_COORDS.
-        Each entry: {name: {'coords': [(x,y,z), ...], 'description': str}}
-        where coords is a list of (x,y,z) tuples (one per hemisphere).
+        ROI definitions. If None, uses default ROI_COORDS.
 
     Returns
     -------
     report_path : str
-        Path to the saved HTML report
-    group_tmap : Nifti1Image
-        Group t-statistic map
     """
     import nibabel as nib
 
     if roi_coords is None:
         roi_coords = ROI_COORDS
 
-    # Collect subject maps
-    contrast_maps, missing = collect_contrast_maps(
+    # Load saved group tmap
+    tmap_path = get_group_tmap_path(
+        session, task, contrast_id, output_dir,
+        mnum=mnum, model_variant=model_variant, space=space,
+    )
+    if not os.path.exists(tmap_path):
+        raise FileNotFoundError(
+            f"Group tmap not found: {tmap_path}\n"
+            f"Run run_group_onesample() first."
+        )
+    group_tmap = nib.load(tmap_path)
+
+    # Determine n_subjects from the subject list
+    _, missing = collect_contrast_maps(
         subjects, session, task, contrast_id, output_dir,
         mnum=mnum, model_variant=model_variant,
         space=space, map_type='effect_size',
     )
+    n_subjects = len(subjects) - len(missing)
+    subjects_used = [f'sub-{s}' for s in subjects if s not in missing]
 
-    if missing:
-        print(f"  WARNING: Missing maps for subjects: {missing}")
-    if len(contrast_maps) < 2:
-        raise ValueError(
-            f"Need at least 2 subjects for group analysis, "
-            f"found {len(contrast_maps)}"
-        )
+    group_dir = get_group_dir(output_dir, mnum, model_variant, session)
+    prefix = get_group_map_prefix(task, space, mnum, model_variant)
 
-    n_subjects = len(contrast_maps)
-    print(f"  Running group analysis: task-{task} {contrast_id} "
+    print(f"  Generating report: task-{task} {contrast_id} "
           f"[{model_variant}] (n={n_subjects})")
-
-    # Fit group model
-    model, group_tmap, group_effect = fit_group_onesample(contrast_maps)
-
-    # Output directory
-    group_dir = os.path.join(
-        output_dir, mnum, model_variant,
-        'group', f'ses-{session}'
-    )
-    os.makedirs(group_dir, exist_ok=True)
-
-    prefix = f'group_task-{task}_space-{space}_{mnum}_{model_variant}'
-
-    # Save maps
-    tmap_fn = os.path.join(group_dir, f'{prefix}_{contrast_id}_tmap.nii.gz')
-    nib.save(group_tmap, tmap_fn)
-
-    effect_fn = os.path.join(
-        group_dir, f'{prefix}_{contrast_id}_effect_size.nii.gz'
-    )
-    nib.save(group_effect, effect_fn)
-
-    print(f"  Saved group maps to: {group_dir}")
 
     # -- Glass brain --
     title_base = (f'Group (n={n_subjects}): task-{task} {contrast_id}\n'
@@ -327,7 +379,7 @@ def generate_group_report(
 </div>
 """
 
-    # -- Cluster table --
+    # -- Cluster table + top 5 peak views --
     cluster_plots_html = ''
     try:
         cluster_table = get_clusters_table(
@@ -340,7 +392,6 @@ def generate_group_report(
         )
         n_clusters = len(cluster_table)
 
-        # -- Top 5 cluster peak views --
         top_n = min(5, len(cluster_table))
         for i in range(top_n):
             row = cluster_table.iloc[i]
@@ -368,13 +419,7 @@ def generate_group_report(
         cluster_html = '<p>No suprathreshold clusters found.</p>'
         n_clusters = 0
 
-    # Subject list
-    subjects_used = [
-        os.path.basename(p).split('_')[0]
-        for p in contrast_maps
-    ]
-
-    # -- HTML report --
+    # -- HTML --
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -461,4 +506,224 @@ def generate_group_report(
         f.write(html)
 
     print(f"  Report saved: {report_path}")
-    return report_path, group_tmap
+    return report_path
+
+
+# =============================================================================
+# Comparison report across model variants and tasks
+# =============================================================================
+
+def generate_comparison_report(
+    subjects, session, contrast_id, output_dir,
+    tasks=('yesNo', 'binaryChoice'),
+    model_variants=('rt_in_duration', 'rt_duration_plus_mod'),
+    mnum='value_parametric',
+    space='MNI152NLin2009cAsym_res-2',
+    threshold=3.0,
+    roi_coords=None,
+    report_dir=None,
+):
+    """
+    Generate an HTML report comparing a contrast across tasks and model
+    variants. Reads previously saved group tmaps (no fitting).
+
+    Parameters
+    ----------
+    subjects : list of str
+    session, contrast_id : str
+    output_dir : str
+        Root output directory (where per-variant group maps live)
+    tasks : tuple of str
+    model_variants : tuple of str
+    mnum, space : str
+    threshold : float
+    roi_coords : dict or None
+    report_dir : str or None
+        If None, defaults to
+        {output_dir}/{mnum}/rt_effect_comparison/group/ses-{session}/
+
+    Returns
+    -------
+    report_path : str
+    """
+    import nibabel as nib
+
+    if roi_coords is None:
+        roi_coords = ROI_COORDS
+
+    if report_dir is None:
+        report_dir = os.path.join(
+            output_dir, mnum, 'rt_effect_comparison',
+            'group', f'ses-{session}'
+        )
+    os.makedirs(report_dir, exist_ok=True)
+
+    # Load all group tmaps
+    group_tmaps = {}
+    for variant in model_variants:
+        for task in tasks:
+            tmap_path = get_group_tmap_path(
+                session, task, contrast_id, output_dir,
+                mnum=mnum, model_variant=variant, space=space,
+            )
+            if os.path.exists(tmap_path):
+                group_tmaps[(variant, task)] = nib.load(tmap_path)
+                print(f"  Loaded: {variant} / {task}")
+            else:
+                print(f"  WARNING: Missing group tmap: {tmap_path}")
+
+    if not group_tmaps:
+        raise FileNotFoundError(
+            "No group tmaps found. Run run_group_onesample() first."
+        )
+
+    variant_labels = {
+        'rt_in_duration': 'RT in duration',
+        'rt_duration_plus_mod': 'RT duration + modulator',
+        'fixed_duration': 'Fixed duration',
+        'fixed_duration_plus_mod': 'Fixed duration + modulator',
+    }
+
+    # -- ROI comparison sections --
+    roi_sections_html = ''
+    for roi_name, roi_info in roi_coords.items():
+        coord_list = roi_info['coords']
+        description = roi_info['description']
+
+        for coords in coord_list:
+            side = 'Left' if coords[0] < 0 else 'Right' if coords[0] > 0 else 'Midline'
+            coord_str = f'({coords[0]}, {coords[1]}, {coords[2]})'
+
+            grid_html = ''
+            for variant in model_variants:
+                for task in tasks:
+                    tmap = group_tmaps.get((variant, task))
+                    if tmap is None:
+                        grid_html += f"""
+        <div class="grid-cell">
+            <h4>{variant_labels.get(variant, variant)} / {task}</h4>
+            <p>Missing</p>
+        </div>
+"""
+                        continue
+
+                    fig = plot_roi_view(
+                        tmap, coords,
+                        title=f'{variant_labels.get(variant, variant)} / {task}',
+                        threshold=threshold,
+                    )
+                    img_b64 = _fig_to_base64(fig)
+
+                    grid_html += f"""
+        <div class="grid-cell">
+            <h4>{variant_labels.get(variant, variant)} / {task}</h4>
+            <img src="data:image/png;base64,{img_b64}" />
+        </div>
+"""
+
+            roi_sections_html += f"""
+<div class="section">
+    <h2>{roi_name} {side} {coord_str}</h2>
+    <p>{description}</p>
+    <div class="comparison-grid">
+        {grid_html}
+    </div>
+</div>
+"""
+
+    # -- Glass brain comparison --
+    glass_html = ''
+    for variant in model_variants:
+        for task in tasks:
+            tmap = group_tmaps.get((variant, task))
+            if tmap is None:
+                continue
+            label = f'{variant_labels.get(variant, variant)} / {task}'
+            fig_glass = plot_group_glass_brain(
+                tmap, title=label, threshold=threshold
+            )
+            img_glass = _fig_to_base64(fig_glass)
+            glass_html += f"""
+        <div class="grid-cell wide">
+            <h4>{label}</h4>
+            <img src="data:image/png;base64,{img_glass}" />
+        </div>
+"""
+
+    # -- HTML --
+    n_tasks = len(tasks)
+    grid_cols = n_tasks
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Comparison Report: {contrast_id} | RT effect</title>
+<style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+           margin: 0; padding: 20px 40px; background: #f8f9fa; color: #333; }}
+    h1 {{ border-bottom: 3px solid #2c3e50; padding-bottom: 10px; color: #2c3e50; }}
+    h2 {{ color: #34495e; border-bottom: 1px solid #bdc3c7; padding-bottom: 6px; margin-top: 30px; }}
+    h3 {{ color: #555; margin-bottom: 8px; }}
+    h4 {{ color: #666; margin: 4px 0; font-size: 13px; }}
+    .section {{ background: #fff; border-radius: 8px; padding: 20px 30px;
+                margin-bottom: 30px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }}
+    .meta {{ color: #888; font-size: 13px; }}
+    .warning {{ color: #856404; background: #fff3cd; border: 1px solid #ffc107;
+                border-radius: 6px; padding: 10px 16px; margin-bottom: 16px; }}
+    .comparison-grid {{
+        display: grid;
+        grid-template-columns: repeat({grid_cols}, 1fr);
+        gap: 12px;
+    }}
+    .grid-cell {{
+        text-align: center;
+        border: 1px solid #e0e0e0;
+        border-radius: 6px;
+        padding: 8px;
+        background: #fafafa;
+    }}
+    .grid-cell.wide {{
+        grid-column: span {grid_cols};
+    }}
+    .grid-cell img {{
+        max-width: 100%; height: auto;
+        border-radius: 4px;
+    }}
+</style>
+</head>
+<body>
+
+<h1>Model Variant Comparison: {contrast_id}</h1>
+<p class="meta">
+    Contrast: <strong>{contrast_id}</strong> |
+    Variants: {', '.join(variant_labels.get(v, v) for v in model_variants)} |
+    Tasks: {', '.join(tasks)}<br>
+    Session: ses-{session} | Space: {space} | Subjects: {', '.join(subjects)}
+</p>
+<div class="warning">
+    All maps shown at t > {threshold} (uncorrected). Columns correspond to
+    tasks, rows to model variants. Each panel shows the same ROI coordinate
+    across conditions.
+</div>
+
+<div class="section">
+    <h2>Glass Brain Overview</h2>
+    <div class="comparison-grid">
+        {glass_html}
+    </div>
+</div>
+
+{roi_sections_html}
+
+</body>
+</html>"""
+
+    report_fn = (f'comparison_{contrast_id}_'
+                 f'{"_vs_".join(model_variants)}_uncorrected_report.html')
+    report_path = os.path.join(report_dir, report_fn)
+    with open(report_path, 'w') as f:
+        f.write(html)
+
+    print(f"  Comparison report saved: {report_path}")
+    return report_path
