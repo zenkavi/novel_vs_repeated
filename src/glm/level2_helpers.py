@@ -26,21 +26,20 @@ from nilearn.reporting import get_clusters_table
 
 
 # =============================================================================
-# ROI definitions (MNI coordinates)
+# ROI definitions (MNI coordinates, bilateral)
 # =============================================================================
 
-# Common coordinates from the value-based decision-making literature.
-# vmPFC: Bartra et al. (2013) meta-analysis, Clithero & Rangel (2014)
-# lOFC: Kringelbach & Rolls (2004) meta-analysis, Noonan et al. (2010)
+# vmPFC: Noonan et al. (2011), Bartra et al. (2013) meta-analysis
+# lOFC: Kringelbach & Rolls (2004) meta-analysis
 
 ROI_COORDS = {
     'vmPFC': {
-        'coords': (0, 48, -10),
-        'description': 'Ventromedial prefrontal cortex (MNI: 0, 48, -10)',
+        'coords': [(-6, 48, -10), (6, 48, -10)],
+        'description': 'Ventromedial prefrontal cortex',
     },
     'lOFC': {
-        'coords': (-32, 42, -18),
-        'description': 'Left lateral orbitofrontal cortex (MNI: -32, 42, -18)',
+        'coords': [(-32, 42, -18), (32, 42, -18)],
+        'description': 'Lateral orbitofrontal cortex',
     },
 }
 
@@ -156,20 +155,19 @@ def plot_group_glass_brain(stat_map, title='', threshold=3.0):
     return fig
 
 
-def plot_roi_view(stat_map, roi_name, coords, title='', threshold=3.0):
+def plot_roi_view(stat_map, coords, title='', threshold=3.0):
     """
-    Three-panel (sagittal, coronal, axial) stat map centered on an ROI.
+    Ortho (sagittal + coronal + axial) stat map centered on one coordinate
+    with crosshairs at the ROI center.
 
     Parameters
     ----------
     stat_map : Nifti1Image
         Group stat map
-    roi_name : str
-        ROI label for the title
-    coords : tuple of 3 ints
+    coords : tuple of 3 ints/floats
         MNI (x, y, z) coordinates to center on
     title : str
-        Additional title text
+        Plot title
     threshold : float
         t-stat threshold for display
 
@@ -177,17 +175,13 @@ def plot_roi_view(stat_map, roi_name, coords, title='', threshold=3.0):
     -------
     fig : matplotlib Figure
     """
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    for ax, display_mode in zip(axes, ['x', 'y', 'z']):
-        cut = coords[{'x': 0, 'y': 1, 'z': 2}[display_mode]]
-        plot_stat_map(
-            stat_map, threshold=threshold,
-            display_mode=display_mode, cut_coords=[cut],
-            axes=ax, colorbar=True,
-            title=f'{roi_name} ({display_mode}={cut})' if not title else '',
-        )
-    if title:
-        fig.suptitle(title, fontsize=13, y=1.02)
+    fig = plt.figure(figsize=(12, 4))
+    display = plot_stat_map(
+        stat_map, threshold=threshold,
+        display_mode='ortho', cut_coords=coords,
+        draw_cross=True, colorbar=True,
+        title=title, figure=fig,
+    )
     return fig
 
 
@@ -235,7 +229,8 @@ def generate_group_report(
         Minimum cluster size (in voxels) for cluster table
     roi_coords : dict or None
         ROI definitions. If None, uses the default ROI_COORDS.
-        Each entry: {name: {'coords': (x,y,z), 'description': str}}
+        Each entry: {name: {'coords': [(x,y,z), ...], 'description': str}}
+        where coords is a list of (x,y,z) tuples (one per hemisphere).
 
     Returns
     -------
@@ -300,42 +295,40 @@ def generate_group_report(
     )
     img_glass = _fig_to_base64(fig_glass)
 
-    # -- ROI views --
+    # -- ROI views (bilateral) --
     roi_sections_html = ''
     for roi_name, roi_info in roi_coords.items():
-        coords = roi_info['coords']
+        coord_list = roi_info['coords']
         description = roi_info['description']
 
-        fig_roi = plot_roi_view(
-            group_tmap, roi_name, coords,
-            title=f'{roi_name}: {description}',
-            threshold=threshold,
-        )
-        img_roi = _fig_to_base64(fig_roi)
+        hemi_plots_html = ''
+        for coords in coord_list:
+            side = 'Left' if coords[0] < 0 else 'Right' if coords[0] > 0 else 'Midline'
+            coord_str = f'({coords[0]}, {coords[1]}, {coords[2]})'
 
-        # Also make an unthresholded version for this ROI
-        fig_roi_unthresh = plot_roi_view(
-            group_tmap, roi_name, coords,
-            title=f'{roi_name} (unthresholded): {description}',
-            threshold=None,
-        )
-        img_roi_unthresh = _fig_to_base64(fig_roi_unthresh)
+            fig_roi = plot_roi_view(
+                group_tmap, coords,
+                title=f'{roi_name} {side} {coord_str}',
+                threshold=threshold,
+            )
+            img_roi = _fig_to_base64(fig_roi)
+
+            hemi_plots_html += f"""
+    <div class="plot-container">
+        <h3>{side} {coord_str}</h3>
+        <img src="data:image/png;base64,{img_roi}" />
+    </div>
+"""
 
         roi_sections_html += f"""
 <div class="section">
     <h2>{roi_name}: {description}</h2>
-    <h3>Thresholded (t > {threshold})</h3>
-    <div class="plot-container">
-        <img src="data:image/png;base64,{img_roi}" />
-    </div>
-    <h3>Unthresholded</h3>
-    <div class="plot-container">
-        <img src="data:image/png;base64,{img_roi_unthresh}" />
-    </div>
+    {hemi_plots_html}
 </div>
 """
 
     # -- Cluster table --
+    cluster_plots_html = ''
     try:
         cluster_table = get_clusters_table(
             group_tmap, stat_threshold=threshold,
@@ -346,6 +339,31 @@ def generate_group_report(
             classes='cluster-table', index=False, float_format='%.2f'
         )
         n_clusters = len(cluster_table)
+
+        # -- Top 5 cluster peak views --
+        top_n = min(5, len(cluster_table))
+        for i in range(top_n):
+            row = cluster_table.iloc[i]
+            peak_coords = (float(row['X']), float(row['Y']), float(row['Z']))
+            peak_stat = float(row['Peak Stat'])
+            cluster_id = row['Cluster ID']
+            cluster_size = row['Cluster Size (mm3)']
+            coord_str = f'({peak_coords[0]:.0f}, {peak_coords[1]:.0f}, {peak_coords[2]:.0f})'
+
+            fig_cluster = plot_roi_view(
+                group_tmap, peak_coords,
+                title=f'Cluster {cluster_id}: {coord_str}, '
+                      f't = {peak_stat:.2f}, {cluster_size} mm3',
+                threshold=threshold,
+            )
+            img_cluster = _fig_to_base64(fig_cluster)
+
+            cluster_plots_html += f"""
+    <div class="plot-container">
+        <h3>Cluster {cluster_id}: peak at {coord_str} (t = {peak_stat:.2f}, {cluster_size} mm3)</h3>
+        <img src="data:image/png;base64,{img_cluster}" />
+    </div>
+"""
     except Exception:
         cluster_html = '<p>No suprathreshold clusters found.</p>'
         n_clusters = 0
@@ -427,6 +445,11 @@ def generate_group_report(
 <div class="section">
     <h2>Cluster Table (t > {threshold}, uncorrected, min {cluster_threshold} voxels)</h2>
     {cluster_html}
+</div>
+
+<div class="section">
+    <h2>Top Cluster Peaks</h2>
+    {cluster_plots_html}
 </div>
 
 </body>
