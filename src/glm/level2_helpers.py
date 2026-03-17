@@ -3,9 +3,10 @@ level2_helpers.py
 Helper functions for group-level (second-level) analyses.
 
 Computes a one-sample t-test across subjects on first-level contrast maps
-(effect size maps) using nilearn's SecondLevelModel. Generates thresholded
-and unthresholded group stat maps and an HTML report with glass brain and
-slice visualizations.
+(effect size maps) using nilearn's SecondLevelModel. Generates group stat
+maps and an HTML report with glass brain and ROI-centered visualizations.
+
+Reports are labeled as uncorrected (no multiple-comparison correction applied).
 """
 
 import base64
@@ -25,6 +26,26 @@ from nilearn.reporting import get_clusters_table
 
 
 # =============================================================================
+# ROI definitions (MNI coordinates)
+# =============================================================================
+
+# Common coordinates from the value-based decision-making literature.
+# vmPFC: Bartra et al. (2013) meta-analysis, Clithero & Rangel (2014)
+# lOFC: Kringelbach & Rolls (2004) meta-analysis, Noonan et al. (2010)
+
+ROI_COORDS = {
+    'vmPFC': {
+        'coords': (0, 48, -10),
+        'description': 'Ventromedial prefrontal cortex (MNI: 0, 48, -10)',
+    },
+    'lOFC': {
+        'coords': (-32, 42, -18),
+        'description': 'Left lateral orbitofrontal cortex (MNI: -32, 42, -18)',
+    },
+}
+
+
+# =============================================================================
 # Path helpers
 # =============================================================================
 
@@ -35,34 +56,7 @@ def get_contrast_path(
     space='MNI152NLin2009cAsym_res-2',
     map_type='effect_size',
 ):
-    """
-    Build the path to a first-level contrast map for one subject.
-
-    Parameters
-    ----------
-    subnum : str
-        Subject number
-    session : str
-        Session number
-    task : str
-        'yesNo' or 'binaryChoice'
-    contrast_id : str
-        Name of the contrast (e.g. 'stim_value_par')
-    output_dir : str
-        Root output directory (same as used for level 1)
-    mnum : str
-        Model name
-    model_variant : str
-        Variant name
-    space : str
-        Output space
-    map_type : str
-        'effect_size' or 'tmap'
-
-    Returns
-    -------
-    str : full path to the .nii.gz file
-    """
+    """Build the path to a first-level contrast map for one subject."""
     prefix = (f'sub-{subnum}_ses-{session}_task-{task}'
               f'_space-{space}_{mnum}_{model_variant}')
 
@@ -82,21 +76,6 @@ def collect_contrast_maps(
 ):
     """
     Collect first-level contrast maps across subjects.
-
-    Parameters
-    ----------
-    subjects : list of str
-        Subject numbers
-    session : str
-        Session number
-    task : str
-        Task name
-    contrast_id : str
-        Contrast name
-    output_dir : str
-        Root output directory
-    mnum, model_variant, space, map_type : str
-        Passed through to get_contrast_path
 
     Returns
     -------
@@ -131,22 +110,13 @@ def fit_group_onesample(contrast_maps):
     Fit a one-sample t-test (intercept-only second-level model) on a list
     of first-level contrast maps.
 
-    Parameters
-    ----------
-    contrast_maps : list of str
-        Paths to subject-level effect_size maps
-
     Returns
     -------
     second_level_model : SecondLevelModel
-        Fitted model
     group_tmap : Nifti1Image
-        Group t-statistic map
     group_effect : Nifti1Image
-        Group effect size (mean beta) map
     """
     n_subjects = len(contrast_maps)
-
     design_matrix = pd.DataFrame({'intercept': np.ones(n_subjects)})
 
     second_level_model = SecondLevelModel(smoothing_fwhm=None)
@@ -154,12 +124,8 @@ def fit_group_onesample(contrast_maps):
         contrast_maps, design_matrix=design_matrix
     )
 
-    group_tmap = second_level_model.compute_contrast(
-        output_type='stat'
-    )
-    group_effect = second_level_model.compute_contrast(
-        output_type='effect_size'
-    )
+    group_tmap = second_level_model.compute_contrast(output_type='stat')
+    group_effect = second_level_model.compute_contrast(output_type='effect_size')
 
     return second_level_model, group_tmap, group_effect
 
@@ -190,14 +156,38 @@ def plot_group_glass_brain(stat_map, title='', threshold=3.0):
     return fig
 
 
-def plot_group_slices(stat_map, title='', threshold=3.0, cut_coords=7):
-    """Axial slice visualization of a group stat map."""
-    fig, ax = plt.subplots(figsize=(18, 4))
-    plot_stat_map(
-        stat_map, threshold=threshold,
-        display_mode='z', cut_coords=cut_coords,
-        axes=ax, title=title, colorbar=True,
-    )
+def plot_roi_view(stat_map, roi_name, coords, title='', threshold=3.0):
+    """
+    Three-panel (sagittal, coronal, axial) stat map centered on an ROI.
+
+    Parameters
+    ----------
+    stat_map : Nifti1Image
+        Group stat map
+    roi_name : str
+        ROI label for the title
+    coords : tuple of 3 ints
+        MNI (x, y, z) coordinates to center on
+    title : str
+        Additional title text
+    threshold : float
+        t-stat threshold for display
+
+    Returns
+    -------
+    fig : matplotlib Figure
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    for ax, display_mode in zip(axes, ['x', 'y', 'z']):
+        cut = coords[{'x': 0, 'y': 1, 'z': 2}[display_mode]]
+        plot_stat_map(
+            stat_map, threshold=threshold,
+            display_mode=display_mode, cut_coords=[cut],
+            axes=ax, colorbar=True,
+            title=f'{roi_name} ({display_mode}={cut})' if not title else '',
+        )
+    if title:
+        fig.suptitle(title, fontsize=13, y=1.02)
     return fig
 
 
@@ -212,15 +202,18 @@ def generate_group_report(
     space='MNI152NLin2009cAsym_res-2',
     threshold=3.0,
     cluster_threshold=10,
+    roi_coords=None,
 ):
     """
     Run a group-level one-sample t-test and generate an HTML report.
 
+    The report is labeled as uncorrected (no multiple-comparison correction).
+
     Saves to:
         {output_dir}/{mnum}/{model_variant}/group/ses-{session}/
-            group_task-{task}_{contrast_id}_tmap.nii.gz
-            group_task-{task}_{contrast_id}_effect_size.nii.gz
-            group_task-{task}_{contrast_id}_report.html
+            {prefix}_{contrast_id}_tmap.nii.gz
+            {prefix}_{contrast_id}_effect_size.nii.gz
+            {prefix}_{contrast_id}_uncorrected_report.html
 
     Parameters
     ----------
@@ -234,16 +227,15 @@ def generate_group_report(
         Contrast name (e.g. 'stim_value_par')
     output_dir : str
         Root output directory
-    mnum : str
-        Model name
-    model_variant : str
-        Variant name
-    space : str
-        Output space
+    mnum, model_variant, space : str
+        Model identifiers
     threshold : float
-        t-statistic threshold for visualization
+        t-statistic threshold for visualization (uncorrected)
     cluster_threshold : int
         Minimum cluster size (in voxels) for cluster table
+    roi_coords : dict or None
+        ROI definitions. If None, uses the default ROI_COORDS.
+        Each entry: {name: {'coords': (x,y,z), 'description': str}}
 
     Returns
     -------
@@ -253,6 +245,9 @@ def generate_group_report(
         Group t-statistic map
     """
     import nibabel as nib
+
+    if roi_coords is None:
+        roi_coords = ROI_COORDS
 
     # Collect subject maps
     contrast_maps, missing = collect_contrast_maps(
@@ -296,28 +291,51 @@ def generate_group_report(
 
     print(f"  Saved group maps to: {group_dir}")
 
-    # Plots
+    # -- Glass brain --
     title_base = (f'Group (n={n_subjects}): task-{task} {contrast_id}\n'
-                  f'{model_variant} | t > {threshold}')
+                  f'{model_variant} | t > {threshold} (uncorrected)')
 
     fig_glass = plot_group_glass_brain(
         group_tmap, title=title_base, threshold=threshold
     )
     img_glass = _fig_to_base64(fig_glass)
 
-    fig_slices = plot_group_slices(
-        group_tmap, title=title_base, threshold=threshold
-    )
-    img_slices = _fig_to_base64(fig_slices)
+    # -- ROI views --
+    roi_sections_html = ''
+    for roi_name, roi_info in roi_coords.items():
+        coords = roi_info['coords']
+        description = roi_info['description']
 
-    # Unthresholded map
-    fig_unthresh = plot_group_slices(
-        group_tmap, title=f'Group: task-{task} {contrast_id} (unthresholded)',
-        threshold=None
-    )
-    img_unthresh = _fig_to_base64(fig_unthresh)
+        fig_roi = plot_roi_view(
+            group_tmap, roi_name, coords,
+            title=f'{roi_name}: {description}',
+            threshold=threshold,
+        )
+        img_roi = _fig_to_base64(fig_roi)
 
-    # Cluster table
+        # Also make an unthresholded version for this ROI
+        fig_roi_unthresh = plot_roi_view(
+            group_tmap, roi_name, coords,
+            title=f'{roi_name} (unthresholded): {description}',
+            threshold=None,
+        )
+        img_roi_unthresh = _fig_to_base64(fig_roi_unthresh)
+
+        roi_sections_html += f"""
+<div class="section">
+    <h2>{roi_name}: {description}</h2>
+    <h3>Thresholded (t > {threshold})</h3>
+    <div class="plot-container">
+        <img src="data:image/png;base64,{img_roi}" />
+    </div>
+    <h3>Unthresholded</h3>
+    <div class="plot-container">
+        <img src="data:image/png;base64,{img_roi_unthresh}" />
+    </div>
+</div>
+"""
+
+    # -- Cluster table --
     try:
         cluster_table = get_clusters_table(
             group_tmap, stat_threshold=threshold,
@@ -334,16 +352,16 @@ def generate_group_report(
 
     # Subject list
     subjects_used = [
-        os.path.basename(p).split('_')[0]  # sub-601
+        os.path.basename(p).split('_')[0]
         for p in contrast_maps
     ]
 
-    # HTML report
+    # -- HTML report --
     html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>Group Report: {contrast_id} | task-{task} | {model_variant}</title>
+<title>Group Report (uncorrected): {contrast_id} | task-{task} | {model_variant}</title>
 <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
            margin: 0; padding: 20px 40px; background: #f8f9fa; color: #333; }}
@@ -364,17 +382,22 @@ def generate_group_report(
     .info-card {{ flex: 1; min-width: 200px; background: #f0f4f8;
                   border-radius: 6px; padding: 12px 16px; }}
     .info-card h3 {{ margin-top: 0; }}
+    .warning {{ color: #856404; background: #fff3cd; border: 1px solid #ffc107;
+                border-radius: 6px; padding: 10px 16px; margin-bottom: 16px; }}
 </style>
 </head>
 <body>
 
-<h1>Group-Level Analysis Report</h1>
+<h1>Group-Level Analysis Report (Uncorrected)</h1>
 <p class="meta">
     Contrast: <strong>{contrast_id}</strong> | Task: {task} |
     Model: {mnum} | Variant: {model_variant}<br>
-    Session: ses-{session} | Space: {space} |
-    Threshold: t > {threshold} | Min cluster: {cluster_threshold} voxels
+    Session: ses-{session} | Space: {space}
 </p>
+<div class="warning">
+    Results shown at t > {threshold} (uncorrected). No correction for
+    multiple comparisons has been applied. Min cluster size: {cluster_threshold} voxels.
+</div>
 
 <div class="section">
     <h2>Summary</h2>
@@ -387,41 +410,29 @@ def generate_group_report(
         </div>
         <div class="info-card">
             <h3>Results</h3>
-            <p>{n_clusters} suprathreshold clusters (t > {threshold})</p>
+            <p>{n_clusters} suprathreshold clusters (t > {threshold}, uncorrected)</p>
         </div>
     </div>
 </div>
 
 <div class="section">
-    <h2>Glass Brain (t > {threshold})</h2>
+    <h2>Glass Brain (t > {threshold}, uncorrected)</h2>
     <div class="plot-container">
         <img src="data:image/png;base64,{img_glass}" />
     </div>
 </div>
 
-<div class="section">
-    <h2>Axial Slices (t > {threshold})</h2>
-    <div class="plot-container">
-        <img src="data:image/png;base64,{img_slices}" />
-    </div>
-</div>
+{roi_sections_html}
 
 <div class="section">
-    <h2>Axial Slices (unthresholded)</h2>
-    <div class="plot-container">
-        <img src="data:image/png;base64,{img_unthresh}" />
-    </div>
-</div>
-
-<div class="section">
-    <h2>Cluster Table (t > {threshold}, min {cluster_threshold} voxels)</h2>
+    <h2>Cluster Table (t > {threshold}, uncorrected, min {cluster_threshold} voxels)</h2>
     {cluster_html}
 </div>
 
 </body>
 </html>"""
 
-    report_fn = f'{prefix}_{contrast_id}_report.html'
+    report_fn = f'{prefix}_{contrast_id}_uncorrected_report.html'
     report_path = os.path.join(group_dir, report_fn)
     with open(report_path, 'w') as f:
         f.write(html)
