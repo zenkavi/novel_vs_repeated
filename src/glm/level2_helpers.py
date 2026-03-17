@@ -30,6 +30,132 @@ from nilearn.reporting import get_clusters_table
 
 
 # =============================================================================
+# Atlas lookup for anatomical labeling of cluster peaks
+# =============================================================================
+
+_ATLASES = None  # lazy-loaded cache
+
+
+def _load_atlases():
+    """
+    Lazy-load atlas data. Called once on first use, then cached.
+
+    Returns a dict mapping atlas name to (nifti_img, label_lookup_fn).
+    """
+    global _ATLASES
+    if _ATLASES is not None:
+        return _ATLASES
+
+    from nilearn import datasets, image
+
+    _ATLASES = {}
+
+    # Harvard-Oxford cortical atlas
+    # labels is a list where index i corresponds to integer i in the map
+    try:
+        ho = datasets.fetch_atlas_harvard_oxford(
+            'cort-maxprob-thr25-2mm', verbose=0
+        )
+        ho_img = image.load_img(ho.maps)
+        ho_labels = ho.labels  # list, index = voxel value
+
+        def ho_lookup(idx):
+            if 0 <= idx < len(ho_labels):
+                return ho_labels[idx]
+            return 'Unknown'
+
+        _ATLASES['Harvard-Oxford'] = (ho_img, ho_lookup)
+    except Exception as e:
+        print(f"  WARNING: Could not load Harvard-Oxford atlas: {e}")
+
+    # AAL atlas
+    # indices are non-consecutive strings; need to map voxel value -> label
+    try:
+        aal = datasets.fetch_atlas_aal(verbose=0, version='3v2')
+        aal_img = image.load_img(aal.maps)
+        # Build a dict from integer index -> label
+        aal_index_to_label = {
+            int(idx): label
+            for idx, label in zip(aal.indices, aal.labels)
+        }
+
+        def aal_lookup(idx):
+            return aal_index_to_label.get(int(idx), 'Unknown')
+
+        _ATLASES['AAL'] = (aal_img, aal_lookup)
+    except Exception as e:
+        print(f"  WARNING: Could not load AAL atlas: {e}")
+
+    return _ATLASES
+
+
+def coords_to_labels(mni_coords):
+    """
+    Look up anatomical labels for a set of MNI coordinates across all
+    loaded atlases.
+
+    Parameters
+    ----------
+    mni_coords : tuple of 3 floats
+        (x, y, z) in MNI space
+
+    Returns
+    -------
+    dict : {atlas_name: label_string}
+    """
+    atlases = _load_atlases()
+    results = {}
+
+    for name, (img, lookup_fn) in atlases.items():
+        try:
+            inv_aff = np.linalg.inv(img.affine)
+            vox = np.round(
+                inv_aff @ np.array([*mni_coords, 1])
+            )[:3].astype(int)
+
+            data = img.get_fdata()
+            # Bounds check
+            if all(0 <= vox[i] < data.shape[i] for i in range(3)):
+                idx = int(data[vox[0], vox[1], vox[2]])
+                results[name] = lookup_fn(idx)
+            else:
+                results[name] = 'Out of bounds'
+        except Exception:
+            results[name] = 'Error'
+
+    return results
+
+
+def add_atlas_labels_to_cluster_table(cluster_table):
+    """
+    Add atlas label columns to a cluster table DataFrame.
+
+    Parameters
+    ----------
+    cluster_table : DataFrame
+        From nilearn's get_clusters_table, with X, Y, Z columns
+
+    Returns
+    -------
+    cluster_table : DataFrame
+        With additional columns for each atlas
+    """
+    atlases = _load_atlases()
+    if not atlases:
+        return cluster_table
+
+    for atlas_name in atlases:
+        cluster_table[atlas_name] = cluster_table.apply(
+            lambda row: coords_to_labels(
+                (float(row['X']), float(row['Y']), float(row['Z']))
+            ).get(atlas_name, ''),
+            axis=1,
+        )
+
+    return cluster_table
+
+
+# =============================================================================
 # ROI definitions (MNI coordinates, bilateral)
 # =============================================================================
 
@@ -711,6 +837,7 @@ def generate_group_report(
             min_distance=8,
             cluster_threshold=cluster_threshold,
         )
+        cluster_table = add_atlas_labels_to_cluster_table(cluster_table)
         cluster_html = cluster_table.to_html(
             classes='cluster-table', index=False, float_format='%.2f'
         )
