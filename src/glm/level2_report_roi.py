@@ -1,20 +1,71 @@
 """
 level2_report_roi.py
-Generate an ROI-focused HTML report showing uncorrected and TFCE-corrected
-maps side by side for each ROI coordinate, plus a cluster summary table.
+Generate an ROI-focused HTML report with:
+  - Extracted mean betas per subject per ROI sphere
+  - One-sample t-tests with Bonferroni correction
+  - Bar plots showing individual subject betas
+  - Ortho views centered on each ROI
+  - Cluster summary table with atlas labels
 """
 
 import os
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from nilearn.reporting import get_clusters_table
 
 from level2_helpers import (
     ROI_COORDS,
-    get_group_tmap_path, get_group_tfce_logp_path,
-    get_group_dir, get_group_map_prefix,
+    get_group_tmap_path, get_group_dir, get_group_map_prefix,
     collect_contrast_maps, add_atlas_labels_to_cluster_table,
+    extract_roi_betas, roi_ttest_table,
     fig_to_base64, plot_roi_view,
 )
+
+
+def _plot_roi_betas(roi_betas_df, coord_label, ttest_row):
+    """
+    Create a bar plot of individual subject betas for one ROI coordinate
+    with mean and SEM overlay.
+    """
+    sub_data = roi_betas_df[
+        roi_betas_df['coord_label'] == coord_label
+    ].sort_values('subject')
+
+    subjects = sub_data['subject'].values
+    betas = sub_data['mean_beta'].values
+    mean = ttest_row['mean_beta']
+    se = ttest_row['se']
+
+    fig, ax = plt.subplots(figsize=(5, 3.5))
+
+    colors = ['#5b9bd5' if b >= 0 else '#ed7d31' for b in betas]
+    bars = ax.bar(range(len(subjects)), betas, color=colors, alpha=0.8,
+                  edgecolor='white', linewidth=0.5)
+
+    ax.axhline(0, color='#333', linewidth=0.8)
+    ax.axhline(mean, color='#c0392b', linewidth=2, linestyle='-', alpha=0.8)
+    ax.axhspan(mean - se, mean + se, color='#c0392b', alpha=0.12)
+
+    ax.set_xticks(range(len(subjects)))
+    ax.set_xticklabels([f'sub-{s}' for s in subjects], fontsize=8, rotation=45)
+    ax.set_ylabel('Mean beta (effect size)', fontsize=9)
+
+    t_val = ttest_row['t_stat']
+    p_bonf = ttest_row['p_bonf']
+    sig = ttest_row['significant']
+    sig_marker = ' *' if sig else ''
+
+    ax.set_title(
+        f'{coord_label}:  t = {t_val:.2f},  p(Bonf) = {p_bonf:.4f}{sig_marker}',
+        fontsize=10, fontweight='bold' if sig else 'normal',
+    )
+
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    fig.tight_layout()
+    return fig
 
 
 def generate_roi_report(
@@ -28,21 +79,23 @@ def generate_roi_report(
     roi_coords=None,
 ):
     """
-    Generate an ROI-focused HTML report showing uncorrected and TFCE-corrected
-    maps side by side for each ROI coordinate, plus a cluster summary table
-    with atlas labels.
+    Generate an ROI-focused HTML report with:
+      - Spherical ROI extraction of mean betas per subject
+      - One-sample t-tests with Bonferroni correction across ROIs
+      - Bar plots of individual subject betas
+      - Ortho views of the uncorrected group tmap centered on each ROI
+      - Cluster summary table with atlas labels
 
     Saves to:
         {output_dir}/{mnum}/{model_variant}/group/ses-{session}/
             {prefix}_{contrast_id}_roi_report.html
     """
     import nibabel as nib
-    from nilearn.image import math_img
 
     if roi_coords is None:
         roi_coords = ROI_COORDS
 
-    # Load uncorrected tmap
+    # Load uncorrected tmap for visualization
     tmap_path = get_group_tmap_path(
         session, task, contrast_id, output_dir,
         mnum=mnum, model_variant=model_variant, space=space,
@@ -54,25 +107,18 @@ def generate_roi_report(
         )
     group_tmap = nib.load(tmap_path)
 
-    # Try to load TFCE logp map
-    logp_path = get_group_tfce_logp_path(
-        session, task, contrast_id, output_dir,
+    # Extract ROI betas
+    print(f"  Extracting ROI betas...")
+    roi_betas = extract_roi_betas(
+        subjects, session, task, contrast_id, output_dir,
         mnum=mnum, model_variant=model_variant, space=space,
+        roi_coords=roi_coords,
     )
-    has_tfce = os.path.exists(logp_path)
-    if has_tfce:
-        logp_img = nib.load(logp_path)
-        logp_thresh = -np.log10(alpha)
-        corrected_tmap = math_img(
-            f'tmap * (logp > {logp_thresh})',
-            tmap=group_tmap, logp=logp_img,
-        )
-        n_sig_voxels = int(np.sum(corrected_tmap.get_fdata() != 0))
-    else:
-        corrected_tmap = None
-        n_sig_voxels = 0
-        print(f"  NOTE: TFCE logp map not found. "
-              f"Report will show uncorrected maps only.")
+
+    # Run t-tests with Bonferroni correction
+    ttest_results = roi_ttest_table(roi_betas, alpha=alpha)
+    n_tests = len(ttest_results)
+    n_sig = int(ttest_results['significant'].sum())
 
     # Subject info
     _, missing = collect_contrast_maps(
@@ -87,66 +133,83 @@ def generate_roi_report(
     prefix = get_group_map_prefix(task, space, mnum, model_variant)
 
     print(f"  Generating ROI report: task-{task} {contrast_id} "
-          f"[{model_variant}] (n={n_subjects})")
+          f"[{model_variant}] (n={n_subjects}, "
+          f"{n_sig}/{n_tests} ROIs significant after Bonferroni)")
 
-    # -- ROI sections --
+    # -- Build ROI sections --
     roi_sections_html = ''
     for roi_name, roi_info in roi_coords.items():
         coord_list = roi_info['coords']
         description = roi_info['description']
 
-        coord_rows_html = ''
+        coord_panels_html = ''
         for coords in coord_list:
-            side = 'Left' if coords[0] < 0 else 'Right' if coords[0] > 0 else 'Midline'
+            side = 'L' if coords[0] < 0 else 'R' if coords[0] > 0 else 'M'
+            coord_label = f'{roi_name}_{side}'
             coord_str = f'({coords[0]}, {coords[1]}, {coords[2]})'
 
-            # Uncorrected view
-            fig_uncorr = plot_roi_view(
+            # Get t-test row for this coordinate
+            row_mask = ttest_results['coord_label'] == coord_label
+            if not row_mask.any():
+                continue
+            ttest_row = ttest_results[row_mask].iloc[0]
+
+            # Bar plot
+            fig_bar = _plot_roi_betas(roi_betas, coord_label, ttest_row)
+            img_bar = fig_to_base64(fig_bar)
+
+            # Ortho view
+            fig_ortho = plot_roi_view(
                 group_tmap, coords,
-                title=f'Uncorrected (t > {threshold})',
+                title=f'{roi_name} {coord_str} (uncorrected, t > {threshold})',
                 threshold=threshold,
             )
-            img_uncorr = fig_to_base64(fig_uncorr)
+            img_ortho = fig_to_base64(fig_ortho)
 
-            # Corrected view
-            if has_tfce:
-                fig_corr = plot_roi_view(
-                    corrected_tmap, coords,
-                    title=f'TFCE corrected (alpha={alpha})',
-                    threshold=0.01,
-                )
-                img_corr = fig_to_base64(fig_corr)
+            # Significance styling
+            sig = ttest_row['significant']
+            sig_class = 'sig-yes' if sig else 'sig-no'
+            sig_text = 'Significant' if sig else 'Not significant'
 
-                corr_cell = f"""
-                <div class="grid-cell">
-                    <h4>TFCE corrected (alpha={alpha})</h4>
-                    <img src="data:image/png;base64,{img_corr}" />
-                </div>"""
-            else:
-                corr_cell = """
-                <div class="grid-cell">
-                    <h4>TFCE corrected</h4>
-                    <p>Not available</p>
-                </div>"""
-
-            coord_rows_html += f"""
-        <div class="coord-label"><strong>{side} {coord_str}</strong></div>
-        <div class="side-by-side">
-            <div class="grid-cell">
-                <h4>Uncorrected (t > {threshold})</h4>
-                <img src="data:image/png;base64,{img_uncorr}" />
+            coord_panels_html += f"""
+        <div class="coord-panel">
+            <div class="coord-header">
+                <strong>{'Left' if coords[0] < 0 else 'Right' if coords[0] > 0 else 'Midline'} {coord_str}</strong>
+                <span class="{sig_class}">{sig_text} (Bonferroni)</span>
             </div>
-            {corr_cell}
+            <div class="side-by-side">
+                <div class="grid-cell">
+                    <img src="data:image/png;base64,{img_bar}" />
+                </div>
+                <div class="grid-cell">
+                    <img src="data:image/png;base64,{img_ortho}" />
+                </div>
+            </div>
         </div>
 """
 
         roi_sections_html += f"""
 <div class="section">
     <h2>{roi_name}</h2>
-    <p class="roi-desc">{description}</p>
-    {coord_rows_html}
+    <p class="roi-desc">{description} | Sphere radius: {roi_info.get('radius', 10)} mm</p>
+    {coord_panels_html}
 </div>
 """
+
+    # -- T-test summary table --
+    ttest_display = ttest_results[[
+        'roi_name', 'coord_label', 'x', 'y', 'z', 'radius',
+        'n_subjects', 'mean_beta', 'se', 't_stat', 'p_uncorr', 'p_bonf',
+        'significant',
+    ]].copy()
+    ttest_display.columns = [
+        'ROI', 'Label', 'X', 'Y', 'Z', 'Radius (mm)',
+        'N', 'Mean beta', 'SE', 't', 'p (uncorr)', 'p (Bonf)',
+        'Significant',
+    ]
+    ttest_html = ttest_display.to_html(
+        classes='ttest-table', index=False, float_format='%.4f'
+    )
 
     # -- Cluster table with atlas labels --
     try:
@@ -165,11 +228,6 @@ def generate_roi_report(
         n_clusters = 0
 
     # -- HTML --
-    tfce_status = (
-        f'{n_sig_voxels} significant voxels (TFCE, alpha={alpha})'
-        if has_tfce else 'TFCE not run'
-    )
-
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -192,7 +250,7 @@ def generate_roi_report(
     .info-card h3 {{ margin-top: 0; }}
     .side-by-side {{
         display: grid;
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: 1fr 1.8fr;
         gap: 8px;
         margin-bottom: 16px;
     }}
@@ -206,13 +264,32 @@ def generate_roi_report(
     .grid-cell img {{
         max-width: 100%; height: auto; border-radius: 4px;
     }}
-    .coord-label {{
-        margin: 10px 0 4px 0; font-size: 13px;
+    .coord-panel {{
+        margin-bottom: 20px;
+    }}
+    .coord-header {{
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 6px;
+        font-size: 13px;
+    }}
+    .sig-yes {{
+        color: #155724; background: #d4edda;
+        border-radius: 4px; padding: 2px 8px; font-weight: bold;
+    }}
+    .sig-no {{
+        color: #856404; background: #fff3cd;
+        border-radius: 4px; padding: 2px 8px;
     }}
     table {{ border-collapse: collapse; font-size: 13px; }}
     th, td {{ padding: 6px 10px; border: 1px solid #ddd; text-align: left; }}
     th {{ background: #f0f4f8; }}
+    .ttest-table {{ width: 100%; }}
     .cluster-table {{ width: auto; }}
+    .method-note {{ color: #555; font-size: 12px; background: #f0f4f8;
+                    border-radius: 6px; padding: 12px 16px; margin-bottom: 16px;
+                    line-height: 1.6; }}
 </style>
 </head>
 <body>
@@ -225,6 +302,14 @@ def generate_roi_report(
     ROI coordinates from Lakhani et al. (2026) meta-analysis Table 2
 </p>
 
+<div class="method-note">
+    <strong>Method:</strong> For each ROI, mean effect size (beta) was extracted
+    within a spherical mask centered on the coordinate listed below.
+    One-sample t-tests were performed across {n_subjects} subjects, testing
+    whether the mean beta differs from zero. Bonferroni correction was applied
+    across {n_tests} ROI coordinates (corrected alpha = {alpha}/{n_tests} = {alpha/n_tests:.4f}).
+</div>
+
 <div class="section">
     <h2>Summary</h2>
     <div class="info-grid">
@@ -234,20 +319,25 @@ def generate_roi_report(
             <p style="font-size: 12px;">{', '.join(subjects_used)}</p>
         </div>
         <div class="info-card">
-            <h3>Uncorrected</h3>
-            <p>{n_clusters} clusters (t > {threshold})</p>
+            <h3>ROI Tests</h3>
+            <p>{n_sig} / {n_tests} significant after Bonferroni (alpha = {alpha})</p>
         </div>
         <div class="info-card">
-            <h3>TFCE Corrected</h3>
-            <p>{tfce_status}</p>
+            <h3>Whole-brain</h3>
+            <p>{n_clusters} clusters (t > {threshold}, uncorrected)</p>
         </div>
     </div>
+</div>
+
+<div class="section">
+    <h2>ROI Statistical Summary</h2>
+    {ttest_html}
 </div>
 
 {roi_sections_html}
 
 <div class="section">
-    <h2>Cluster Table (t > {threshold}, uncorrected, min {cluster_threshold} voxels)</h2>
+    <h2>Whole-Brain Cluster Table (t > {threshold}, uncorrected, min {cluster_threshold} voxels)</h2>
     {cluster_html}
 </div>
 
