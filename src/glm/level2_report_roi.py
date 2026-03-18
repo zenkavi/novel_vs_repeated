@@ -20,14 +20,16 @@ from level2_helpers import (
     get_group_tmap_path, get_group_dir, get_group_map_prefix,
     collect_contrast_maps, add_atlas_labels_to_cluster_table,
     extract_roi_betas, roi_ttest_table,
+    extract_roi_betas_with_variance,
     fig_to_base64, plot_roi_view,
 )
 
 
-def _plot_roi_betas(roi_betas_df, coord_label, ttest_row):
+def _plot_roi_betas(roi_betas_df, coord_label, ttest_row, var_df=None):
     """
     Create a bar plot of individual subject betas for one ROI coordinate
-    with mean and SEM overlay.
+    with per-subject error bars (SE = SD/sqrt(n_voxels) across voxels
+    within the ROI sphere) and group mean overlay.
     """
     sub_data = roi_betas_df[
         roi_betas_df['coord_label'] == coord_label
@@ -36,19 +38,35 @@ def _plot_roi_betas(roi_betas_df, coord_label, ttest_row):
     subjects = sub_data['subject'].values
     betas = sub_data['mean_beta'].values
     mean = ttest_row['mean_beta']
-    se = ttest_row['se']
+    se_group = ttest_row['se']
+
+    # Get per-subject SE from variance dataframe if available
+    n = len(subjects)
+    se_per_sub = np.zeros(n)
+    if var_df is not None:
+        for i, subnum in enumerate(subjects):
+            row = var_df[
+                (var_df['coord_label'] == coord_label) &
+                (var_df['subject'] == subnum)
+            ]
+            if len(row) > 0:
+                se_per_sub[i] = row.iloc[0]['se_beta']
 
     fig, ax = plt.subplots(figsize=(5, 3.5))
 
     colors = ['#5b9bd5' if b >= 0 else '#ed7d31' for b in betas]
-    bars = ax.bar(range(len(subjects)), betas, color=colors, alpha=0.8,
+    bars = ax.bar(range(n), betas, color=colors, alpha=0.8,
                   edgecolor='white', linewidth=0.5)
+
+    if var_df is not None:
+        ax.errorbar(range(n), betas, yerr=se_per_sub, fmt='none',
+                    ecolor='#444', elinewidth=1.2, capsize=3, capthick=1)
 
     ax.axhline(0, color='#333', linewidth=0.8)
     ax.axhline(mean, color='#c0392b', linewidth=2, linestyle='-', alpha=0.8)
-    ax.axhspan(mean - se, mean + se, color='#c0392b', alpha=0.12)
+    ax.axhspan(mean - se_group, mean + se_group, color='#c0392b', alpha=0.12)
 
-    ax.set_xticks(range(len(subjects)))
+    ax.set_xticks(range(n))
     ax.set_xticklabels([f'sub-{s}' for s in subjects], fontsize=8, rotation=45)
     ax.set_ylabel('Mean beta (effect size)', fontsize=9)
 
@@ -115,6 +133,14 @@ def generate_roi_report(
         roi_coords=roi_coords,
     )
 
+    # Extract voxelwise variance for per-subject error bars
+    print(f"  Extracting voxelwise variance for error bars...")
+    var_df = extract_roi_betas_with_variance(
+        subjects, session, task, contrast_id, output_dir,
+        mnum=mnum, model_variant=model_variant, space=space,
+        roi_coords=roi_coords,
+    )
+
     # Run t-tests with Bonferroni correction
     ttest_results = roi_ttest_table(roi_betas, alpha=alpha)
     n_tests = len(ttest_results)
@@ -155,7 +181,7 @@ def generate_roi_report(
             ttest_row = ttest_results[row_mask].iloc[0]
 
             # Bar plot
-            fig_bar = _plot_roi_betas(roi_betas, coord_label, ttest_row)
+            fig_bar = _plot_roi_betas(roi_betas, coord_label, ttest_row, var_df=var_df)
             img_bar = fig_to_base64(fig_bar)
 
             # Ortho view

@@ -22,15 +22,18 @@ from level2_helpers import (
     get_group_dir, get_group_map_prefix,
     collect_contrast_maps, add_atlas_labels_to_cluster_table,
     extract_roi_betas_paired, roi_paired_ttest_table,
+    extract_roi_betas_with_variance,
     fig_to_base64, plot_group_glass_brain, plot_roi_view,
 )
 
 
 def _plot_paired_roi_betas(paired_betas_df, coord_label, ttest_row,
-                           ses_a_label, ses_b_label):
+                           ses_a_label, ses_b_label,
+                           var_df_a=None, var_df_b=None):
     """
     Create a paired bar plot showing session A and session B betas for
-    each subject, with the group mean difference annotated.
+    each subject, with per-subject error bars (SE = SD/sqrt(n_voxels)
+    across voxels within the ROI sphere).
     """
     sub_data = paired_betas_df[
         paired_betas_df['coord_label'] == coord_label
@@ -40,6 +43,25 @@ def _plot_paired_roi_betas(paired_betas_df, coord_label, ttest_row,
     betas_a = sub_data['beta_ses_a'].values
     betas_b = sub_data['beta_ses_b'].values
     n = len(subjects)
+
+    # Get per-subject SE from variance dataframes if available
+    se_a = np.zeros(n)
+    se_b = np.zeros(n)
+    if var_df_a is not None and var_df_b is not None:
+        for i, subnum in enumerate(subjects):
+            row_a = var_df_a[
+                (var_df_a['coord_label'] == coord_label) &
+                (var_df_a['subject'] == subnum)
+            ]
+            if len(row_a) > 0:
+                se_a[i] = row_a.iloc[0]['se_beta']
+
+            row_b = var_df_b[
+                (var_df_b['coord_label'] == coord_label) &
+                (var_df_b['subject'] == subnum)
+            ]
+            if len(row_b) > 0:
+                se_b[i] = row_b.iloc[0]['se_beta']
 
     fig, ax = plt.subplots(figsize=(6, 3.5))
 
@@ -51,11 +73,10 @@ def _plot_paired_roi_betas(paired_betas_df, coord_label, ttest_row,
     bars_b = ax.bar(x + width/2, betas_b, width, label=ses_b_label,
                     color='#2171b5', alpha=0.85, edgecolor='white', linewidth=0.5)
 
-    # Connect paired observations
-    for i in range(n):
-        ax.plot([x[i] - width/2, x[i] + width/2],
-                [betas_a[i], betas_b[i]],
-                color='#999', linewidth=0.8, alpha=0.6)
+    ax.errorbar(x - width/2, betas_a, yerr=se_a, fmt='none',
+                ecolor='#444', elinewidth=1.2, capsize=3, capthick=1)
+    ax.errorbar(x + width/2, betas_b, yerr=se_b, fmt='none',
+                ecolor='#444', elinewidth=1.2, capsize=3, capthick=1)
 
     ax.axhline(0, color='#333', linewidth=0.8)
 
@@ -210,6 +231,19 @@ def generate_paired_report(
     n_tests = len(ttest_results)
     n_sig = int(ttest_results['significant'].sum())
 
+    # Extract voxelwise variance for per-subject error bars
+    print(f"  Extracting voxelwise variance for error bars...")
+    var_df_a = extract_roi_betas_with_variance(
+        subjects, ses_a, task, contrast_id, output_dir,
+        mnum=mnum, model_variant=model_variant, space=space,
+        roi_coords=roi_coords,
+    )
+    var_df_b = extract_roi_betas_with_variance(
+        subjects, ses_b, task, contrast_id, output_dir,
+        mnum=mnum, model_variant=model_variant, space=space,
+        roi_coords=roi_coords,
+    )
+
     # -- Build ROI sections --
     roi_sections_html = ''
     for roi_name, roi_info in roi_coords.items():
@@ -231,6 +265,7 @@ def generate_paired_report(
             fig_bar = _plot_paired_roi_betas(
                 paired_betas, coord_label, ttest_row,
                 ses_a_label, ses_b_label,
+                var_df_a=var_df_a, var_df_b=var_df_b,
             )
             img_bar = fig_to_base64(fig_bar)
 

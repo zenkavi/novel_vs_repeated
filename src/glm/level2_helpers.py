@@ -536,6 +536,131 @@ def extract_roi_betas(
     return pd.DataFrame(rows)
 
 
+def _make_sphere_mask(coords, radius, ref_img):
+    """
+    Create a binary sphere mask image in the space of ref_img.
+
+    Parameters
+    ----------
+    coords : tuple of 3 floats
+        Center of sphere in MNI mm
+    radius : float
+        Radius in mm
+    ref_img : nibabel image
+        Reference image defining the voxel grid and affine
+
+    Returns
+    -------
+    mask_img : nibabel.Nifti1Image
+        Binary mask with 1 inside sphere, 0 outside
+    """
+    import nibabel as nib
+
+    affine = ref_img.affine
+    shape = ref_img.shape[:3]
+
+    i, j, k = np.meshgrid(
+        np.arange(shape[0]), np.arange(shape[1]), np.arange(shape[2]),
+        indexing='ij',
+    )
+    vox_coords = np.stack([i.ravel(), j.ravel(), k.ravel(), np.ones(i.size)])
+    mm_coords = (affine @ vox_coords)[:3].T
+    center_mm = np.array(coords)
+    dist = np.sqrt(np.sum((mm_coords - center_mm) ** 2, axis=1))
+    mask_data = (dist <= radius).reshape(shape).astype(np.int8)
+
+    return nib.Nifti1Image(mask_data, affine)
+
+
+def extract_roi_betas_with_variance(
+    subjects, session, task, contrast_id, output_dir,
+    mnum='value_parametric',
+    model_variant='rt_in_duration',
+    space='MNI152NLin2009cAsym_res-2',
+    roi_coords=None,
+):
+    """
+    Extract mean beta, SD, and voxel count within each ROI sphere
+    for each subject. Uses voxelwise extraction (not just the mean).
+
+    Returns
+    -------
+    results : pandas.DataFrame
+        Columns: subject, roi_name, coord_label, x, y, z, radius,
+                 mean_beta, sd_beta, n_voxels, se_beta
+    """
+    from nilearn.maskers import NiftiMasker
+
+    if roi_coords is None:
+        roi_coords = ROI_COORDS
+
+    # Build flat ROI list
+    roi_list = []
+    for roi_name, roi_info in roi_coords.items():
+        radius = roi_info.get('radius', 10)
+        for coords in roi_info['coords']:
+            side = 'L' if coords[0] < 0 else 'R' if coords[0] > 0 else 'M'
+            label = f'{roi_name}_{side}'
+            roi_list.append((roi_name, label, coords, radius))
+
+    # Build sphere masks using first available subject as reference
+    ref_img = None
+    for subnum in subjects:
+        map_path = get_contrast_path(
+            subnum, session, task, contrast_id, output_dir,
+            mnum=mnum, model_variant=model_variant,
+            space=space, map_type='effect_size',
+        )
+        if os.path.exists(map_path):
+            ref_img = load_img(map_path)
+            break
+
+    if ref_img is None:
+        raise FileNotFoundError("No subject maps found to use as reference.")
+
+    # Pre-build sphere masks and maskers
+    maskers = {}
+    for roi_name, label, coords, radius in roi_list:
+        sphere_mask = _make_sphere_mask(coords, radius, ref_img)
+        maskers[label] = NiftiMasker(mask_img=sphere_mask, standardize=False)
+
+    rows = []
+    for subnum in subjects:
+        map_path = get_contrast_path(
+            subnum, session, task, contrast_id, output_dir,
+            mnum=mnum, model_variant=model_variant,
+            space=space, map_type='effect_size',
+        )
+        if not os.path.exists(map_path):
+            print(f"  WARNING: Missing map for sub-{subnum}, skipping")
+            continue
+
+        for roi_name, label, coords, radius in roi_list:
+            voxel_values = maskers[label].fit_transform(map_path)
+            voxel_values = np.squeeze(voxel_values)
+
+            n_vox = len(voxel_values)
+            mean_val = float(np.mean(voxel_values))
+            sd_val = float(np.std(voxel_values, ddof=1)) if n_vox > 1 else 0.0
+            se_val = sd_val / np.sqrt(n_vox) if n_vox > 0 else 0.0
+
+            rows.append({
+                'subject': subnum,
+                'roi_name': roi_name,
+                'coord_label': label,
+                'x': coords[0],
+                'y': coords[1],
+                'z': coords[2],
+                'radius': radius,
+                'mean_beta': mean_val,
+                'sd_beta': sd_val,
+                'n_voxels': n_vox,
+                'se_beta': float(se_val),
+            })
+
+    return pd.DataFrame(rows)
+
+
 def roi_ttest_table(roi_betas_df, alpha=0.05):
     """
     Run one-sample t-tests on extracted ROI betas and apply Bonferroni
