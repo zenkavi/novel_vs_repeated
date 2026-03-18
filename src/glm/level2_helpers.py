@@ -596,3 +596,195 @@ def roi_ttest_table(roi_betas_df, alpha=0.05):
         })
 
     return pd.DataFrame(rows)
+
+
+# =============================================================================
+# Paired session comparison (e.g., week 3 vs week 1)
+# =============================================================================
+
+def run_group_paired_ttest(
+    subjects, sessions, task, contrast_id, output_dir,
+    mnum='value_parametric',
+    model_variant='rt_in_duration',
+    space='MNI152NLin2009cAsym_res-2',
+):
+    """
+    Run a paired t-test comparing two sessions at the group level.
+
+    Computes (session_b - session_a) difference maps per subject, then
+    fits a one-sample t-test on the differences.
+
+    Parameters
+    ----------
+    subjects : list of str
+    sessions : tuple of (session_a, session_b)
+        e.g., ('01', '03') to test ses-03 > ses-01
+    task, contrast_id : str
+    output_dir : str
+    mnum, model_variant, space : str
+
+    Returns
+    -------
+    tmap_path : str
+    effect_path : str
+    """
+    import nibabel as nib
+    from nilearn.image import math_img
+
+    ses_a, ses_b = sessions
+
+    diff_maps = []
+    missing = []
+    for subnum in subjects:
+        path_a = get_contrast_path(
+            subnum, ses_a, task, contrast_id, output_dir,
+            mnum=mnum, model_variant=model_variant,
+            space=space, map_type='effect_size',
+        )
+        path_b = get_contrast_path(
+            subnum, ses_b, task, contrast_id, output_dir,
+            mnum=mnum, model_variant=model_variant,
+            space=space, map_type='effect_size',
+        )
+        if not os.path.exists(path_a) or not os.path.exists(path_b):
+            missing.append(subnum)
+            continue
+
+        diff = math_img('b - a', a=path_a, b=path_b)
+        diff_maps.append(diff)
+
+    if missing:
+        print(f"  WARNING: Missing maps for subjects: {missing}")
+    if len(diff_maps) < 2:
+        raise ValueError(
+            f"Need at least 2 subjects with both sessions, "
+            f"found {len(diff_maps)}"
+        )
+
+    n_subjects = len(diff_maps)
+    print(f"  Fitting paired t-test: ses-{ses_b} - ses-{ses_a}, "
+          f"task-{task} {contrast_id} [{model_variant}] (n={n_subjects})")
+
+    model, group_tmap, group_effect = fit_group_onesample(diff_maps)
+
+    # Save with a paired-specific naming convention
+    group_dir = get_group_dir(output_dir, mnum, model_variant, ses_b)
+    os.makedirs(group_dir, exist_ok=True)
+    prefix = get_group_map_prefix(task, space, mnum, model_variant)
+
+    tmap_path = os.path.join(
+        group_dir,
+        f'{prefix}_{contrast_id}_ses{ses_b}_minus_ses{ses_a}_tmap.nii.gz'
+    )
+    nib.save(group_tmap, tmap_path)
+
+    effect_path = os.path.join(
+        group_dir,
+        f'{prefix}_{contrast_id}_ses{ses_b}_minus_ses{ses_a}_effect_size.nii.gz'
+    )
+    nib.save(group_effect, effect_path)
+
+    print(f"  Saved paired maps to: {group_dir}")
+    return tmap_path, effect_path
+
+
+def extract_roi_betas_paired(
+    subjects, sessions, task, contrast_id, output_dir,
+    mnum='value_parametric',
+    model_variant='rt_in_duration',
+    space='MNI152NLin2009cAsym_res-2',
+    roi_coords=None,
+):
+    """
+    Extract mean betas per subject per ROI for two sessions, returning
+    both individual session betas and the difference.
+
+    Returns
+    -------
+    results : pandas.DataFrame
+        Columns: subject, roi_name, coord_label, x, y, z, radius,
+                 beta_ses_a, beta_ses_b, beta_diff
+    """
+    if roi_coords is None:
+        roi_coords = ROI_COORDS
+
+    ses_a, ses_b = sessions
+
+    df_a = extract_roi_betas(
+        subjects, ses_a, task, contrast_id, output_dir,
+        mnum=mnum, model_variant=model_variant, space=space,
+        roi_coords=roi_coords,
+    )
+    df_b = extract_roi_betas(
+        subjects, ses_b, task, contrast_id, output_dir,
+        mnum=mnum, model_variant=model_variant, space=space,
+        roi_coords=roi_coords,
+    )
+
+    merged = df_a.merge(
+        df_b,
+        on=['subject', 'roi_name', 'coord_label', 'x', 'y', 'z', 'radius'],
+        suffixes=(f'_ses{ses_a}', f'_ses{ses_b}'),
+    )
+
+    merged = merged.rename(columns={
+        f'mean_beta_ses{ses_a}': 'beta_ses_a',
+        f'mean_beta_ses{ses_b}': 'beta_ses_b',
+    })
+    merged['beta_diff'] = merged['beta_ses_b'] - merged['beta_ses_a']
+
+    return merged
+
+
+def roi_paired_ttest_table(paired_betas_df, alpha=0.05):
+    """
+    Run paired t-tests (ses_b - ses_a) on extracted ROI betas with
+    Bonferroni correction.
+    """
+    from scipy import stats
+
+    groups = paired_betas_df.groupby('coord_label', sort=False)
+    n_tests = len(groups)
+
+    rows = []
+    for label, group in groups:
+        diffs = group['beta_diff'].values
+        betas_a = group['beta_ses_a'].values
+        betas_b = group['beta_ses_b'].values
+        n = len(diffs)
+
+        mean_a = float(np.mean(betas_a))
+        mean_b = float(np.mean(betas_b))
+        mean_diff = float(np.mean(diffs))
+        se_diff = float(np.std(diffs, ddof=1) / np.sqrt(n))
+
+        if n >= 2 and se_diff > 0:
+            t_stat, p_val = stats.ttest_1samp(diffs, 0)
+            t_stat = float(t_stat)
+            p_val = float(p_val)
+        else:
+            t_stat = np.nan
+            p_val = np.nan
+
+        p_bonf = min(p_val * n_tests, 1.0) if not np.isnan(p_val) else np.nan
+
+        first = group.iloc[0]
+        rows.append({
+            'roi_name': first['roi_name'],
+            'coord_label': label,
+            'x': first['x'],
+            'y': first['y'],
+            'z': first['z'],
+            'radius': first['radius'],
+            'n_subjects': n,
+            'mean_beta_ses_a': mean_a,
+            'mean_beta_ses_b': mean_b,
+            'mean_diff': mean_diff,
+            'se_diff': se_diff,
+            't_stat': t_stat,
+            'p_uncorr': p_val,
+            'p_bonf': p_bonf,
+            'significant': p_bonf < alpha if not np.isnan(p_bonf) else False,
+        })
+
+    return pd.DataFrame(rows)
