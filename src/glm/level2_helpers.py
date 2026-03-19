@@ -457,8 +457,9 @@ def plot_roi_view(stat_map, coords, title='', threshold=3.0):
 
 def plot_stacked_sessions(stat_maps, coords, labels, threshold=3.0):
     """
-    Plot multiple stat maps stacked vertically, each showing sagittal
-    and coronal views centered on the same coordinate.
+    Plot multiple stat maps stacked vertically, each showing an ortho view
+    (sagittal + coronal + axial) centered on the same coordinate. All maps
+    share the same colormap scale.
 
     Parameters
     ----------
@@ -471,24 +472,34 @@ def plot_stacked_sessions(stat_maps, coords, labels, threshold=3.0):
     -------
     fig : matplotlib Figure
     """
+    import nibabel as nib
+
+    # Compute shared vmax across all maps
+    vmax = 0
+    for smap in stat_maps:
+        data = smap.get_fdata() if hasattr(smap, 'get_fdata') else nib.load(smap).get_fdata()
+        abs_max = float(np.nanmax(np.abs(data)))
+        if abs_max > vmax:
+            vmax = abs_max
+    if vmax == 0:
+        vmax = None
+
     n_maps = len(stat_maps)
-    fig, axes = plt.subplots(n_maps, 2, figsize=(8, 2.5 * n_maps))
+    fig, axes = plt.subplots(n_maps, 1, figsize=(10, 3.2 * n_maps))
     if n_maps == 1:
-        axes = axes.reshape(1, 2)
+        axes = [axes]
 
     for i, (smap, label) in enumerate(zip(stat_maps, labels)):
-        for j, mode in enumerate(['x', 'y']):
-            cut = coords[0] if mode == 'x' else coords[1]
-            plot_stat_map(
-                smap, threshold=threshold,
-                display_mode=mode, cut_coords=[cut],
-                draw_cross=True, colorbar=(j == 1),
-                title=label if j == 0 else '',
-                axes=axes[i, j],
-                annotate=False,
-            )
+        plot_stat_map(
+            smap, threshold=threshold,
+            display_mode='ortho', cut_coords=coords,
+            draw_cross=True, colorbar=True,
+            title=label,
+            axes=axes[i],
+            vmax=vmax,
+        )
 
-    fig.tight_layout(h_pad=0.5)
+    fig.tight_layout(h_pad=1.0)
     return fig
 
 
@@ -590,20 +601,6 @@ def extract_roi_betas(
 def _make_sphere_mask(coords, radius, ref_img):
     """
     Create a binary sphere mask image in the space of ref_img.
-
-    Parameters
-    ----------
-    coords : tuple of 3 floats
-        Center of sphere in MNI mm
-    radius : float
-        Radius in mm
-    ref_img : nibabel image
-        Reference image defining the voxel grid and affine
-
-    Returns
-    -------
-    mask_img : nibabel.Nifti1Image
-        Binary mask with 1 inside sphere, 0 outside
     """
     import nibabel as nib
 
@@ -623,6 +620,31 @@ def _make_sphere_mask(coords, radius, ref_img):
     return nib.Nifti1Image(mask_data, affine)
 
 
+# Module-level cache for fitted NiftiMasker objects.
+# Key: (coords_tuple, radius, shape_tuple, affine_bytes)
+# Value: fitted NiftiMasker
+_MASKER_CACHE = {}
+
+
+def _get_cached_masker(coords, radius, ref_img):
+    """Get or create a cached NiftiMasker for a sphere ROI."""
+    from nilearn.maskers import NiftiMasker
+
+    cache_key = (
+        tuple(coords),
+        radius,
+        ref_img.shape[:3],
+        ref_img.affine.tobytes(),
+    )
+
+    if cache_key not in _MASKER_CACHE:
+        sphere_mask = _make_sphere_mask(coords, radius, ref_img)
+        masker = NiftiMasker(mask_img=sphere_mask, standardize=False)
+        _MASKER_CACHE[cache_key] = masker
+
+    return _MASKER_CACHE[cache_key]
+
+
 def extract_roi_betas_with_variance(
     subjects, session, task, contrast_id, output_dir,
     mnum='value_parametric',
@@ -633,6 +655,7 @@ def extract_roi_betas_with_variance(
     """
     Extract mean beta, SD, and voxel count within each ROI sphere
     for each subject. Uses voxelwise extraction (not just the mean).
+    Maskers are cached across calls for speed.
 
     Returns
     -------
@@ -640,8 +663,6 @@ def extract_roi_betas_with_variance(
         Columns: subject, roi_name, coord_label, x, y, z, radius,
                  mean_beta, sd_beta, n_voxels, se_beta
     """
-    from nilearn.maskers import NiftiMasker
-
     if roi_coords is None:
         roi_coords = ROI_COORDS
 
@@ -654,7 +675,7 @@ def extract_roi_betas_with_variance(
             label = f'{roi_name}_{side}'
             roi_list.append((roi_name, label, coords, radius))
 
-    # Build sphere masks using first available subject as reference
+    # Find a reference image for building masks
     ref_img = None
     for subnum in subjects:
         map_path = get_contrast_path(
@@ -669,11 +690,10 @@ def extract_roi_betas_with_variance(
     if ref_img is None:
         raise FileNotFoundError("No subject maps found to use as reference.")
 
-    # Pre-build sphere masks and maskers
+    # Get or create cached maskers
     maskers = {}
     for roi_name, label, coords, radius in roi_list:
-        sphere_mask = _make_sphere_mask(coords, radius, ref_img)
-        maskers[label] = NiftiMasker(mask_img=sphere_mask, standardize=False)
+        maskers[label] = _get_cached_masker(coords, radius, ref_img)
 
     rows = []
     for subnum in subjects:
