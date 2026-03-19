@@ -187,6 +187,20 @@ def add_atlas_labels_to_cluster_table(cluster_table):
     return cluster_table
 
 
+def is_cerebellar(cluster_row):
+    """
+    Check whether a cluster table row is in the cerebellum based on
+    atlas labels. Returns True if any atlas column contains 'cerebellum'
+    (case-insensitive).
+    """
+    for col in ['Harvard-Oxford', 'AAL']:
+        if col in cluster_row.index:
+            val = str(cluster_row[col]).lower()
+            if 'cerebell' in val:
+                return True
+    return False
+
+
 # =============================================================================
 # Path helpers
 # =============================================================================
@@ -438,6 +452,43 @@ def plot_roi_view(stat_map, coords, title='', threshold=3.0):
         draw_cross=True, colorbar=True,
         title=title, figure=fig,
     )
+    return fig
+
+
+def plot_stacked_sessions(stat_maps, coords, labels, threshold=3.0):
+    """
+    Plot multiple stat maps stacked vertically, each showing sagittal
+    and coronal views centered on the same coordinate.
+
+    Parameters
+    ----------
+    stat_maps : list of Niimg-like
+    coords : tuple of 3 floats
+    labels : list of str, one per map
+    threshold : float
+
+    Returns
+    -------
+    fig : matplotlib Figure
+    """
+    n_maps = len(stat_maps)
+    fig, axes = plt.subplots(n_maps, 2, figsize=(8, 2.5 * n_maps))
+    if n_maps == 1:
+        axes = axes.reshape(1, 2)
+
+    for i, (smap, label) in enumerate(zip(stat_maps, labels)):
+        for j, mode in enumerate(['x', 'y']):
+            cut = coords[0] if mode == 'x' else coords[1]
+            plot_stat_map(
+                smap, threshold=threshold,
+                display_mode=mode, cut_coords=[cut],
+                draw_cross=True, colorbar=(j == 1),
+                title=label if j == 0 else '',
+                axes=axes[i, j],
+                annotate=False,
+            )
+
+    fig.tight_layout(h_pad=0.5)
     return fig
 
 

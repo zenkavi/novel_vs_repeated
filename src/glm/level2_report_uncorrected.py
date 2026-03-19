@@ -16,6 +16,7 @@ from level2_helpers import (
     ROI_COORDS,
     get_group_tmap_path, get_group_dir, get_group_map_prefix,
     collect_contrast_maps, add_atlas_labels_to_cluster_table,
+    is_cerebellar,
     extract_roi_betas_with_variance,
     fig_to_base64, plot_group_glass_brain, plot_roi_view,
 )
@@ -189,11 +190,16 @@ def generate_group_report(
         )
         n_clusters = len(cluster_table)
 
-        # Build ad-hoc ROI coords from cluster peaks for extraction
-        n_panels = min(max_cluster_panels, len(cluster_table))
+        # Build ad-hoc ROI coords from non-cerebellar cluster peaks
+        non_cb_rows = [
+            i for i in range(len(cluster_table))
+            if not is_cerebellar(cluster_table.iloc[i])
+        ]
+        n_panels = min(max_cluster_panels, len(non_cb_rows))
         if n_panels > 0:
             cluster_roi_coords = {}
-            for i in range(n_panels):
+            panel_indices = non_cb_rows[:n_panels]
+            for i in panel_indices:
                 row = cluster_table.iloc[i]
                 peak_coords = (float(row['X']), float(row['Y']), float(row['Z']))
                 cluster_id = str(row['Cluster ID'])
@@ -215,7 +221,7 @@ def generate_group_report(
                 }
 
             # Extract betas for all cluster peaks
-            print(f"  Extracting betas for {n_panels} cluster peaks...")
+            print(f"  Extracting betas for {n_panels} non-cerebellar cluster peaks...")
             cluster_var_df = extract_roi_betas_with_variance(
                 subjects, session, task, contrast_id, output_dir,
                 mnum=mnum, model_variant=model_variant, space=space,
@@ -223,7 +229,7 @@ def generate_group_report(
             )
 
             # Build panels
-            for i in range(n_panels):
+            for i in panel_indices:
                 row = cluster_table.iloc[i]
                 peak_coords = (float(row['X']), float(row['Y']), float(row['Z']))
                 peak_stat = float(row['Peak Stat'])
@@ -307,6 +313,9 @@ def generate_group_report(
     .info-card h3 {{ margin-top: 0; }}
     .warning {{ color: #856404; background: #fff3cd; border: 1px solid #ffc107;
                 border-radius: 6px; padding: 10px 16px; margin-bottom: 16px; }}
+    .exploratory-note {{ color: #555; font-size: 12px; background: #f0f4f8;
+                         border-radius: 6px; padding: 10px 16px; margin: 30px 0 16px 0;
+                         line-height: 1.5; }}
     .side-by-side {{
         display: grid;
         grid-template-columns: 1fr 1.8fr;
@@ -374,6 +383,12 @@ def generate_group_report(
     <h2>Cluster Table (t > {threshold}, uncorrected, min {cluster_threshold} voxels)</h2>
     {cluster_html}
 </div>
+
+<p class="exploratory-note">
+    <strong>Exploratory cluster panels (non-cerebellar clusters only):</strong>
+    Individual subject betas extracted from 10mm spheres centered on each
+    cluster peak. These are data-driven coordinates, not pre-registered ROIs.
+</p>
 
 {cluster_panels_html}
 
