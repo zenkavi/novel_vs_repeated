@@ -152,8 +152,61 @@ MODEL_VARIANTS = {
 
 
 # =============================================================================
-# Data loading
+# Split-by-type model: separate HT and RE value regressors
 # =============================================================================
+#
+# Regressor specs use a 4-tuple: (reg_name, event_type, modulation, type_filter)
+# where type_filter is None (all trials), 'HT' (type==1), or 'RE' (type==0).
+# For non-stim events, type_filter is always None.
+
+MODEL_VARIANTS_BY_TYPE = {
+    'rt_duration_plus_mod': {
+        'description': 'RT as stimulus duration + RT modulator, split by stimulus type',
+        'stim_duration': None,
+        'regressor_specs': {
+            'yesNo': [
+                ('cross_ev',            'fixCross', 1,                None),
+                ('stim_ev_HT',          'stim',     1,                'HT'),
+                ('stim_value_par_HT',   'stim',     'valStim_dmn',    'HT'),
+                ('stim_rt_par_HT',      'stim',     '_rt_dmn',        'HT'),
+                ('stim_ev_RE',          'stim',     1,                'RE'),
+                ('stim_value_par_RE',   'stim',     'valStim_dmn',    'RE'),
+                ('stim_rt_par_RE',      'stim',     '_rt_dmn',        'RE'),
+                ('feedback_ev',         'feedback', 1,                None),
+                ('reward_par',          'feedback', 'reward_dmn',     None),
+            ],
+            'binaryChoice': [
+                ('cross_ev',            'fixCross', 1,                            None),
+                ('stim_ev_HT',          'stim',     1,                            'HT'),
+                ('stim_value_par_HT',   'stim',     'valChosenMinusUnchosen_dmn', 'HT'),
+                ('stim_rt_par_HT',      'stim',     '_rt_dmn',                    'HT'),
+                ('stim_ev_RE',          'stim',     1,                            'RE'),
+                ('stim_value_par_RE',   'stim',     'valChosenMinusUnchosen_dmn', 'RE'),
+                ('stim_rt_par_RE',      'stim',     '_rt_dmn',                    'RE'),
+                ('feedback_ev',         'feedback', 1,                            None),
+                ('reward_par',          'feedback', 'reward_dmn',                 None),
+            ],
+        },
+        'task_regressors': [
+            'cross_ev',
+            'stim_ev_HT', 'stim_value_par_HT', 'stim_rt_par_HT',
+            'stim_ev_RE', 'stim_value_par_RE', 'stim_rt_par_RE',
+            'feedback_ev', 'reward_par',
+        ],
+    },
+}
+
+
+def _type_filter_to_mask(behavior, type_filter):
+    """Convert 'HT'/'RE'/None to a boolean mask over behavior rows."""
+    if type_filter is None:
+        return None
+    elif type_filter == 'HT':
+        return (behavior['type'] == 1).values
+    elif type_filter == 'RE':
+        return (behavior['type'] == 0).values
+    else:
+        raise ValueError(f"Unknown type_filter: {type_filter}")
 
 def get_from_sidecar(subnum, session, task, runnum, keyname, data_path):
     """Read metadata from BOLD sidecar JSON."""
@@ -244,7 +297,7 @@ def _load_events_and_behavior(subnum, session, task, runnum, data_path):
 
 
 def _make_regressor(events, behavior, event_type, reg_name, modulation,
-                    stim_duration=None):
+                    stim_duration=None, trial_mask=None):
     """
     Build a single regressor DataFrame from events and behavior.
 
@@ -257,10 +310,18 @@ def _make_regressor(events, behavior, event_type, reg_name, modulation,
         Otherwise, a column name in the behavior DataFrame.
     stim_duration : float or None
         If not None, override duration for 'stim' events only.
+    trial_mask : array-like of bool or None
+        If provided, must have length equal to the number of stim events.
+        Only trials where mask is True are included. Used for splitting
+        by stimulus type (HT vs RE).
     """
-    df = events.query(
-        f'trial_type == "{event_type}"'
-    )[['onset', 'duration']].reset_index(drop=True)
+    mask = events['trial_type'] == event_type
+    df = events.loc[mask, ['onset', 'duration']].reset_index(drop=True)
+
+    # Apply trial_mask (only for stim-type events where mask is relevant)
+    if trial_mask is not None and event_type == 'stim':
+        trial_mask = np.asarray(trial_mask, dtype=bool)
+        df = df.loc[trial_mask].reset_index(drop=True)
 
     # Compute RT modulator BEFORE overriding duration
     if modulation == '_rt_dmn':
@@ -269,7 +330,10 @@ def _make_regressor(events, behavior, event_type, reg_name, modulation,
     elif isinstance(modulation, (int, float)):
         mod_values = modulation
     else:
-        mod_values = behavior[modulation].values
+        if trial_mask is not None and event_type == 'stim':
+            mod_values = behavior.loc[trial_mask, modulation].values
+        else:
+            mod_values = behavior[modulation].values
 
     # Override stim duration if requested
     if stim_duration is not None and event_type == 'stim':
@@ -285,6 +349,10 @@ def get_events_value_parametric(subnum, session, task, runnum, data_path,
                                 regressor_specs=None, stim_duration=None):
     """
     Build event regressors for the value parametric model.
+
+    Regressor specs can be 3-tuples (reg_name, event_type, modulation)
+    or 4-tuples (reg_name, event_type, modulation, type_filter) where
+    type_filter is 'HT', 'RE', or None.
     """
     events, behavior = _load_events_and_behavior(
         subnum, session, task, runnum, data_path
@@ -293,11 +361,19 @@ def get_events_value_parametric(subnum, session, task, runnum, data_path,
     if regressor_specs is None:
         regressor_specs = MODEL_VARIANTS['rt_in_duration']['regressor_specs'][task]
 
-    regressors = [
-        _make_regressor(events, behavior, event_type, reg_name, modulation,
-                        stim_duration=stim_duration)
-        for reg_name, event_type, modulation in regressor_specs
-    ]
+    regressors = []
+    for spec in regressor_specs:
+        if len(spec) == 4:
+            reg_name, event_type, modulation, type_filter = spec
+            trial_mask = _type_filter_to_mask(behavior, type_filter)
+        else:
+            reg_name, event_type, modulation = spec
+            trial_mask = None
+
+        regressors.append(
+            _make_regressor(events, behavior, event_type, reg_name, modulation,
+                            stim_duration=stim_duration, trial_mask=trial_mask)
+        )
 
     formatted_events = pd.concat(regressors, ignore_index=True)
     formatted_events = formatted_events.sort_values('onset').reset_index(drop=True)
@@ -310,15 +386,34 @@ def get_events_value_parametric(subnum, session, task, runnum, data_path,
 # Design matrix
 # =============================================================================
 
+def _get_variant(model_variant, mnum='value_parametric'):
+    """Look up a model variant, using mnum to select the correct dict."""
+    if mnum == 'value_parametric_by_type':
+        if model_variant in MODEL_VARIANTS_BY_TYPE:
+            return MODEL_VARIANTS_BY_TYPE[model_variant]
+        raise KeyError(
+            f"Unknown model_variant '{model_variant}' for mnum '{mnum}'. "
+            f"Available: {list(MODEL_VARIANTS_BY_TYPE)}"
+        )
+    else:
+        if model_variant in MODEL_VARIANTS:
+            return MODEL_VARIANTS[model_variant]
+        raise KeyError(
+            f"Unknown model_variant '{model_variant}' for mnum '{mnum}'. "
+            f"Available: {list(MODEL_VARIANTS)}"
+        )
+
+
 def make_design_matrix_value_parametric(
     subnum, session, task, runnum, data_path,
     model_variant='rt_in_duration',
+    mnum='value_parametric',
     space='MNI152NLin2009cAsym_res-2',
     hrf_model='spm', drift_model='cosine',
     scrub_thresh=0.5
 ):
     """Build the first-level design matrix for one run."""
-    variant = MODEL_VARIANTS[model_variant]
+    variant = _get_variant(model_variant, mnum=mnum)
 
     tr = get_from_sidecar(subnum, session, task, runnum, 'RepetitionTime', data_path)
     n_scans = get_n_scans(subnum, session, task, runnum, data_path, space)
@@ -373,7 +468,12 @@ def compute_vif(design_matrix, columns=None):
 # =============================================================================
 
 def make_contrasts(design_matrix):
-    """Canonical contrasts for each task regressor (vs baseline)."""
+    """
+    Canonical contrasts for each task regressor (vs baseline).
+
+    Also adds difference contrasts for split-by-type models:
+      stim_value_par_HT_minus_RE, stim_ev_HT_minus_RE, stim_rt_par_HT_minus_RE
+    """
     contrast_matrix = np.eye(design_matrix.shape[1])
     contrasts = {
         col: contrast_matrix[i]
@@ -386,6 +486,17 @@ def make_contrasts(design_matrix):
         k: v for k, v in contrasts.items()
         if all(filt not in k for filt in to_filter)
     }
+
+    # Add HT minus RE difference contrasts if both exist
+    cols = list(design_matrix.columns)
+    for base_name in ['stim_value_par', 'stim_ev', 'stim_rt_par']:
+        ht_name = f'{base_name}_HT'
+        re_name = f'{base_name}_RE'
+        if ht_name in cols and re_name in cols:
+            diff = np.zeros(len(cols))
+            diff[cols.index(ht_name)] = 1
+            diff[cols.index(re_name)] = -1
+            beh_contrasts[f'{base_name}_HT_minus_RE'] = diff
 
     return beh_contrasts
 
@@ -506,7 +617,7 @@ def generate_report(
     design_matrices : dict
         Maps (task, runnum) to design matrix DataFrames
     """
-    variant = MODEL_VARIANTS[model_variant]
+    variant = _get_variant(model_variant, mnum=mnum)
     task_regs = variant['task_regressors']
 
     # Output path includes sub/ses
@@ -534,6 +645,7 @@ def generate_report(
         dm = make_design_matrix_value_parametric(
             subnum, session, task, runnum, data_path,
             model_variant=model_variant,
+            mnum=mnum,
             space=space, hrf_model=hrf_model, drift_model=drift_model,
             scrub_thresh=scrub_thresh
         )
